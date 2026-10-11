@@ -36,6 +36,16 @@ public sealed class AgentApiClient : IDisposable {
         request.Headers.Add("X-Job-Lease",leaseToken);
         using var response=await client.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,ct);
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Document download returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
+        if(response.Content.Headers.ContentType?.MediaType?.Equals("application/json",StringComparison.OrdinalIgnoreCase)==true){
+            using var payload=JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
+            var uri=new Uri(payload.RootElement.GetProperty("downloadUrl").GetString()??throw new InvalidOperationException("API did not return a document URL."));
+            if(uri.Scheme!="https")throw new InvalidOperationException("Private document URL must use HTTPS.");
+            // Use an unauthenticated client: the agent bearer token is scoped to the API and must never be sent to Blob.
+            using var storageClient=new HttpClient{Timeout=TimeSpan.FromMinutes(2)};
+            using var download=await storageClient.GetAsync(uri,HttpCompletionOption.ResponseHeadersRead,ct);
+            if(!download.IsSuccessStatusCode)throw new HttpRequestException($"Private document download returned {(int)download.StatusCode}.");
+            return await download.Content.ReadAsByteArrayAsync(ct);
+        }
         return await response.Content.ReadAsByteArrayAsync(ct);
     }
     public async Task<byte[]> GetBytesAsync(string route,CancellationToken ct=default) {

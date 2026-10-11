@@ -118,6 +118,15 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
 
   const unauthenticated = await call(`/shops/${shop.id}/orders`);
   assert.equal(unauthenticated.status, 401, 'shop orders require authentication');
+  const priorVercel=process.env.VERCEL;
+  try {
+    process.env.VERCEL='1';
+    const prefixedHealth=await call('/api/health');
+    assert.equal(prefixedHealth.status,200,'Vercel /api prefix is routed to the Express health endpoint');
+    assert.equal((await prefixedHealth.json() as {database:string}).database,'ready');
+    const protectedUpload=await call('/api/documents/upload-url',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+    assert.equal(protectedUpload.status,401,'Vercel upload URL requires customer authentication before storage access');
+  } finally { if(priorVercel===undefined)delete process.env.VERCEL;else process.env.VERCEL=priorVercel; }
   const qr = await call(`/shops/${shop.slug}/qr.svg`);
   assert.equal(qr.status, 200);
   assert.match(qr.headers.get('content-type')||'',/image\/svg\+xml/);

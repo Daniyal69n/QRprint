@@ -103,10 +103,7 @@ public static class Program {
 
     private static bool IsResolved(JsonElement state) {
         var status=state.GetProperty("status").GetString();var physical=state.GetProperty("physicalStatus").GetString();
-        return status == "SIMULATED_COMPLETE" ||
-            (status == "CANCELLED" && physical == "NOT_SUBMITTED") ||
-            (status == "FAILED" && physical == "NOT_SUBMITTED") ||
-            physical == "OUTPUT_CONFIRMED";
+        return status == "SIMULATED_COMPLETE" || physical == "OUTPUT_CONFIRMED";
     }
 
     private static async Task SyncSpoolEntryAsync(AgentApiClient api,IPrinterAdapter adapter,LocalPrintJob entry) {
@@ -115,8 +112,9 @@ public static class Program {
         catch(Exception ex){Console.Error.WriteLine($"Local job {entry.Id} retained; API is unavailable: {ex.Message}");return;}
         using(response){
             var state=response.RootElement;var status=state.GetProperty("status").GetString()??"";var leaseOwned=state.GetProperty("leaseOwned").GetBoolean();
-            if(IsResolved(state)){await AgentLocalSpool.DeleteAsync(entry.Id);Console.WriteLine($"Local file for resolved job {entry.Id} was removed.");return;}
-            if(status=="QUEUED"&&(entry.Stage is "DOWNLOADED" or "SUBMISSION_INTENT")) {await AgentLocalSpool.DeleteAsync(entry.Id);return;}
+            if(IsResolved(state)){await AgentLocalSpool.DeleteAsync(entry.ShopId,entry.Id);Console.WriteLine($"Local file for resolved job {entry.Id} was removed.");return;}
+            // A requeued job may be claimed again; preserve its encrypted PDF across retries.
+            if(status=="QUEUED")return;
             if(status=="OUTCOME_UNKNOWN"){
                 if(entry.Stage is "SUBMISSION_INTENT" or "SUBMITTING"){
                     entry=await SetPendingResultAsync(entry,"OUTCOME_UNKNOWN","Agent restarted or lost connectivity after submission began; operator reconciliation is required.");
@@ -143,7 +141,7 @@ public static class Program {
                 return;
             }
             if(entry.Stage is "DOWNLOADED" or "SUBMISSION_INTENT"){
-                if(!leaseOwned||status is not("LEASED" or "DOWNLOADED")){if(status is "FAILED" or "CANCELLED" or "QUEUED")await AgentLocalSpool.DeleteAsync(entry.Id);return;}
+                if(!leaseOwned||status is not("LEASED" or "DOWNLOADED")){if(status is "FAILED" or "CANCELLED" or "QUEUED")await AgentLocalSpool.DeleteAsync(entry.ShopId,entry.Id);return;}
                 await SubmitDownloadedAsync(api,adapter,entry);
             }
         }
@@ -161,10 +159,10 @@ public static class Program {
         entry=entry with{Stage="SUBMITTING"};await AgentLocalSpool.SaveAsync(entry);
         string resultStatus,resultError="";
         try{
-            var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.Id);
+            var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id);
             PrintResult result;
             try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy); }
-            finally { await AgentLocalSpool.DeleteSubmissionCopyAsync(entry.Id,submissionCopy); }
+            finally { await AgentLocalSpool.DeleteSubmissionCopyAsync(entry.ShopId,entry.Id,submissionCopy); }
             if(entry.Mode=="SIMULATED"&&result.Accepted)resultStatus="SIMULATED_COMPLETE";
             else if(entry.Mode=="REAL"&&result.Accepted)resultStatus="SPOOLER_ACCEPTED";
             else resultStatus="OUTCOME_UNKNOWN";
@@ -184,6 +182,7 @@ public static class Program {
             while(true){try{initialHeartbeat=await api.PostAsync("agent/heartbeat",new {ping=true});break;}catch(Exception ex){Console.Error.WriteLine($"API is unavailable; reconnecting in five seconds: {ex.Message}");await Task.Delay(TimeSpan.FromSeconds(5));}}
             using var heartbeat=initialHeartbeat;
             var device=heartbeat.RootElement.GetProperty("device");
+            var shopId=device.GetProperty("shopId").GetString()??throw new InvalidOperationException("API heartbeat did not return the enrolled shop ID.");
             var mode=device.GetProperty("mode").GetString()??"";
             if(!mode.Equals(requestedMode,StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException($"Enrolled agent mode is {mode}; configured mode is {requestedMode}. Re-enroll or configure the correct mode.");
             var printer=heartbeat.RootElement.GetProperty("printer");
@@ -201,7 +200,7 @@ public static class Program {
             }
             keepAlive=Task.Run(async()=>{while(!stop.IsCancellationRequested){try{if(mode=="REAL"){var current=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.OrdinalIgnoreCase))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);using var h=await api.PostAsync("agent/heartbeat",new {observedQueue=ToObservedQueue(current)},stop.Token);Console.WriteLine($"Heartbeat accepted; assigned queue status: {current.Status}.");}else{using var h=await api.PostAsync("agent/heartbeat",new {ping=true},stop.Token);Console.WriteLine("Simulated heartbeat accepted; no Windows printer queue was accessed.");}}catch(OperationCanceledException) when(stop.IsCancellationRequested){break;}catch(Exception ex){Console.Error.WriteLine($"API heartbeat failed: {ex.Message}");}try{await Task.Delay(TimeSpan.FromSeconds(15),stop.Token);}catch(OperationCanceledException){break;}}});
             while(true){
-                foreach(var localJob in await AgentLocalSpool.LoadAllAsync())await SyncSpoolEntryAsync(api,adapter,localJob);
+                foreach(var localJob in await AgentLocalSpool.LoadAllAsync(shopId))await SyncSpoolEntryAsync(api,adapter,localJob);
                 JsonDocument claim;
                 try { claim=await api.PostAsync("agent/jobs/claim",new {ping=true}); }
                 catch(Exception ex){Console.Error.WriteLine($"Job claim failed; reconnecting in five seconds: {ex.Message}");await Task.Delay(TimeSpan.FromSeconds(5));continue;}
@@ -212,7 +211,7 @@ public static class Program {
                 Console.WriteLine($"Claimed job {id} ({mode}); downloading fitted PDF.");
                 try {
                     var bytes=await api.DownloadAsync(id,token);
-                    var local=await AgentLocalSpool.SaveDownloadedAsync(id,token,mode,queueName,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
+                    var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
                     await SyncSpoolEntryAsync(api,adapter,local);
                 } catch(Exception ex){Console.Error.WriteLine($"Job {id} was not submitted; local download persistence or delivery failed: {ex.Message}");}
             }

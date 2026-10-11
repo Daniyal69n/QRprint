@@ -10,6 +10,7 @@ export function apiUrl(path: string) {
     if(process.env.NODE_ENV==='production')throw new Error('NEXT_PUBLIC_API_URL must be set to the deployed public HTTPS API before building QR Print for production.');
     return `http://localhost:4000${path}`;
   }
+  if(configured==='/api')return `/api${path}`;
   let url:URL;
   try{url=new URL(configured);}catch{throw new Error('NEXT_PUBLIC_API_URL is not a valid absolute URL.');}
   if(process.env.NODE_ENV==='production'){
