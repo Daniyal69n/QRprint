@@ -8,7 +8,7 @@ import { PDFDocument } from 'pdf-lib';
 import { PrismaClient } from '@prisma/client';
 import { issueToken } from './auth.js';
 import { hashSecret, mintAgentSecret } from './agent-core.js';
-import { createApp } from './server.js';
+import { createApp } from './app.js';
 
 const db = new PrismaClient();
 const testUrl = process.env.DATABASE_URL;
