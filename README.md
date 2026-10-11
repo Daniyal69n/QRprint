@@ -148,4 +148,5 @@ The Windows Agent retrieves an authorized job only after its shop/printer bindin
 
 Vercel Services requests keep their `/api` prefix, which the API adapter strips before dispatch. Local development continues to use the existing separate ports and filesystem storage. Use `NEXT_PUBLIC_API_URL=http://localhost:4000` locally and `QRPRINT_STORAGE_PROVIDER=filesystem`; do not set `VERCEL=1` locally. Public Vercel Services availability, production build behavior, private Blob provisioning, network access to a chosen hosted PostgreSQL provider, and real deployment routing must be verified in the Vercel account before calling this deployed. This repository change does not deploy anything. Vercel Function duration/memory limits still apply to PDF parsing and fitting; very large or complex PDFs may require a separate durable worker service. Vercel Services account access is also a prerequisite; if unavailable, keep Express on a separate persistent host and route `/api` to it rather than dropping the API.
 #   Q R p r i n t  
+ #   Q R p r i n t  
  
