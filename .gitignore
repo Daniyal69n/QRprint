@@ -1,0 +1,26 @@
+node_modules/
+.npm-cache/
+.next/
+dist/
+**/storage/
+.vercel/
+*.tsbuildinfo
+apps/windows-agent/publish/
+# Local database files, customer PDFs, and generated installer binaries.
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.pdf
+*.exe
+*.msi
+**/pgdata/
+**/postgres-data/
+.env
+.env.*
+!.env.example
+coverage/
+*.user
+bin/
+obj/

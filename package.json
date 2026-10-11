@@ -1,0 +1,35 @@
+{
+  "name": "qr-print",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "npm --workspace @qr-print/web run dev",
+    "dev:api": "npm --workspace @qr-print/api run dev",
+    "build": "npm --workspaces run build",
+    "lint": "npm --workspaces run lint",
+    "typecheck": "npm --workspaces run typecheck",
+    "test": "npm --workspaces run test",
+    "test:integration": "npm --workspace @qr-print/api run test:integration",
+    "db:check-target": "npm --workspace @qr-print/api run db:check-target",
+    "db:migrate": "npm --workspace @qr-print/api run db:migrate",
+    "db:migrate:test": "npm --workspace @qr-print/api run db:migrate:test",
+    "db:generate": "npm --workspace @qr-print/api run db:generate",
+    "db:seed": "npm --workspace @qr-print/api run db:seed",
+    "agent:sim": "dotnet run --project apps/windows-agent -- --mode simulated"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "eslint": "^10.12.0",
+    "typescript": "^5.7.3",
+    "typescript-eslint": "^8.71.1"
+  },
+  "overrides": {
+    "@types/express-serve-static-core": "4.19.9"
+  }
+}

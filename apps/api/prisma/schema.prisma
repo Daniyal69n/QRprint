@@ -1,0 +1,231 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  CUSTOMER
+  SHOP_OWNER
+  SUPER_ADMIN
+  AGENT
+}
+enum OrderStatus {
+  OPEN
+  READY_FOR_PICKUP
+  CANCELLED
+}
+enum PaymentStatus {
+  PENDING
+  VERIFIED
+  CASH_AUTHORIZED
+  FAILED
+  REFUNDED
+}
+enum PrintMode {
+  SIMULATED
+  REAL
+}
+enum PrintJobStatus {
+  QUEUED
+  LEASED
+  DOWNLOADED
+  SUBMITTING
+  SPOOLER_ACCEPTED
+  SIMULATED_COMPLETE
+  FAILED
+  OUTCOME_UNKNOWN
+  CANCELLED
+}
+enum PhysicalPrintStatus {
+  NOT_SUBMITTED
+  SPOOLER_ACCEPTED
+  OUTPUT_CONFIRMED
+  SIMULATED_ONLY
+  UNKNOWN
+}
+enum DocumentStatus {
+  UPLOADED
+  PROCESSED
+  REJECTED
+}
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  passwordHash String
+  role         Role         @default(CUSTOMER)
+  createdAt    DateTime     @default(now())
+  shops        Shop[]
+  orders       Order[]
+  documents    Document[]
+  auditLogs    AuditLog[]
+  agentDevice  AgentDevice?
+  agentEvents  AgentEvent[]
+}
+
+model Shop {
+  id        String        @id @default(cuid())
+  ownerId   String
+  name      String
+  slug      String        @unique
+  isActive  Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  owner     User          @relation(fields: [ownerId], references: [id])
+  printers  Printer[]
+  orders    Order[]
+  pricing   Pricing[]
+  agents    AgentDevice[]
+}
+
+model Printer {
+  id             String     @id @default(cuid())
+  shopId         String
+  name           String
+  queueName      String?
+  connectionType String?
+  status         String     @default("UNKNOWN")
+  capabilities   Json?
+  createdAt      DateTime   @default(now())
+  shop           Shop       @relation(fields: [shopId], references: [id])
+  jobs           PrintJob[]
+  agents         AgentDevice[]
+}
+
+model AgentDevice {
+  id            String   @id @default(cuid())
+  shopId        String
+  userId        String   @unique
+  name          String
+  deviceKeyHash String   @unique
+  printerId     String?
+  mode          PrintMode @default(SIMULATED)
+  lastSeenAt    DateTime?
+  createdAt     DateTime @default(now())
+  shop          Shop     @relation(fields: [shopId], references: [id])
+  user          User     @relation(fields: [userId], references: [id])
+  printer       Printer? @relation(fields: [printerId], references: [id])
+  jobs          PrintJob[]
+  events        AgentEvent[]
+}
+
+model Document {
+  id        String         @id @default(cuid())
+  ownerId   String
+  storageKey String
+  mimeType  String
+  pageCount Int?
+  status    DocumentStatus @default(UPLOADED)
+  deletedAt DateTime?
+  createdAt DateTime       @default(now())
+  owner     User           @relation(fields: [ownerId], references: [id])
+  orders    Order[]
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  customerId      String
+  shopId          String
+  documentId      String
+  status          OrderStatus @default(OPEN)
+  copies          Int         @default(1)
+  paperSize       String      @default("A4")
+  color           Boolean     @default(false)
+  total           Decimal     @db.Decimal(10, 2)
+  idempotencyKey  String      @unique
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  customer        User        @relation(fields: [customerId], references: [id])
+  shop            Shop        @relation(fields: [shopId], references: [id])
+  document        Document    @relation(fields: [documentId], references: [id])
+  payment         Payment?
+  printJob        PrintJob?
+}
+
+model Pricing {
+  id             String   @id @default(cuid())
+  shopId         String
+  paperSize      String
+  color          Boolean  @default(false)
+  pricePerPage   Decimal  @db.Decimal(10, 2)
+  colorSurcharge Decimal  @default(0) @db.Decimal(10, 2)
+  simpleDefaults Json?
+  updatedAt      DateTime @updatedAt
+  shop           Shop     @relation(fields: [shopId], references: [id])
+  @@unique([shopId, paperSize, color])
+}
+
+model Payment {
+  id         String   @id @default(cuid())
+  orderId    String   @unique
+  provider   String
+  providerRef String?
+  amount     Decimal  @db.Decimal(10, 2)
+  status     PaymentStatus @default(PENDING)
+  createdAt  DateTime @default(now())
+  verifiedAt DateTime?
+  order      Order    @relation(fields: [orderId], references: [id])
+}
+
+model PrintJob {
+  id            String    @id @default(cuid())
+  orderId       String    @unique
+  printerId     String?
+  mode          PrintMode
+  status        PrintJobStatus @default(QUEUED)
+  physicalStatus PhysicalPrintStatus @default(NOT_SUBMITTED)
+  attempt       Int       @default(0)
+  maxAttempts   Int       @default(3)
+  idempotencyKey String   @unique
+  claimedById   String?
+  leaseTokenHash String?
+  leaseExpiresAt DateTime?
+  submissionStartedAt DateTime?
+  nextAttemptAt DateTime?
+  error         String?
+  externalJobId String?
+  createdAt     DateTime  @default(now())
+  completedAt   DateTime?
+  order         Order     @relation(fields: [orderId], references: [id])
+  printer       Printer?  @relation(fields: [printerId], references: [id])
+  claimedBy     AgentDevice? @relation(fields: [claimedById], references: [id])
+  events        AgentEvent[]
+  @@index([status, nextAttemptAt, createdAt])
+  @@index([claimedById, leaseExpiresAt])
+}
+
+model AgentEvent {
+  id            String      @id @default(cuid())
+  jobId         String
+  agentDeviceId String
+  actorId       String?
+  eventKey      String
+  eventType     String
+  payload       Json?
+  createdAt     DateTime    @default(now())
+  job           PrintJob    @relation(fields: [jobId], references: [id])
+  agentDevice   AgentDevice @relation(fields: [agentDeviceId], references: [id])
+  actor         User?       @relation(fields: [actorId], references: [id])
+  @@unique([jobId, eventKey])
+  @@index([createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  action     String
+  targetType String
+  targetId   String?
+  details    Json?
+  createdAt  DateTime @default(now())
+  actor      User?    @relation(fields: [actorId], references: [id])
+}
+
+model PlatformSetting {
+  id                    String   @id @default("platform")
+  commissionBasisPoints Int      @default(0)
+  updatedAt             DateTime @updatedAt
+}

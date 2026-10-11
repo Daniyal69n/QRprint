@@ -1,0 +1,297 @@
+import { after, before, test } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { once } from 'node:events';
+import { PDFDocument } from 'pdf-lib';
+import { PrismaClient } from '@prisma/client';
+import { issueToken } from './auth.js';
+import { hashSecret, mintAgentSecret } from './agent-core.js';
+import { createApp } from './server.js';
+
+const db = new PrismaClient();
+const testUrl = process.env.DATABASE_URL;
+const parsedTestUrl = testUrl ? new URL(testUrl) : undefined;
+if (!parsedTestUrl || !['postgres:', 'postgresql:'].includes(parsedTestUrl.protocol) || decodeURIComponent(parsedTestUrl.pathname.slice(1)) !== 'qr_print_test') {
+  throw new Error('Integration tests refuse any DATABASE_URL other than qr_print_test.');
+}
+const actualDatabase = async () => {
+  const rows = await db.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
+  assert.equal(rows[0]?.name, 'qr_print_test', 'PostgreSQL must confirm qr_print_test before fixtures or cleanup');
+};
+
+const tag = `qr-it-${randomUUID()}`;
+const userIds: string[] = [];
+const shopIds: string[] = [];
+const printerIds: string[] = [];
+const agentIds: string[] = [];
+const documentIds: string[] = [];
+const orderIds: string[] = [];
+const paymentIds: string[] = [];
+const jobIds: string[] = [];
+const auditTargetIds: string[] = [];
+let server: ReturnType<ReturnType<typeof createApp>['listen']> | undefined;
+let baseUrl = '';
+let pdfPath = '';
+
+before(async () => {
+  await actualDatabase();
+  const app = createApp(db);
+  server = app.listen(0);
+  await once(server, 'listening');
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Integration HTTP server failed to bind an ephemeral port.');
+  baseUrl = `http://127.0.0.1:${address.port}`;
+});
+
+after(async () => {
+  if (server) { server.close(); await once(server, 'close'); }
+  await actualDatabase();
+  // Delete only primary keys captured from this run's UUID-tagged fixture.
+  await db.auditLog.deleteMany({ where: { OR: [{ actorId: { in: userIds } }, { targetId: { in: auditTargetIds } }] } });
+  await db.agentEvent.deleteMany({ where: { jobId: { in: jobIds } } });
+  await db.printJob.deleteMany({ where: { id: { in: jobIds } } });
+  await db.payment.deleteMany({ where: { id: { in: paymentIds } } });
+  await db.order.deleteMany({ where: { id: { in: orderIds } } });
+  await db.document.deleteMany({ where: { id: { in: documentIds } } });
+  await db.pricing.deleteMany({ where: { shopId: { in: shopIds } } });
+  await db.agentDevice.deleteMany({ where: { id: { in: agentIds } } });
+  await db.printer.deleteMany({ where: { id: { in: printerIds } } });
+  await db.shop.deleteMany({ where: { id: { in: shopIds } } });
+  await db.user.deleteMany({ where: { id: { in: userIds } } });
+  if (pdfPath) await rm(pdfPath, { force: true });
+  await db.$disconnect();
+});
+
+test('database-backed tenant, payment, queue, agent lease, event, and retry workflows', async () => {
+  await actualDatabase();
+  const [owner, otherOwner, customer, agentUser, contenderUser, admin] = await Promise.all([
+    db.user.create({ data: { email: `${tag}-owner@integration.invalid`, passwordHash: 'test-only', role: 'SHOP_OWNER' } }),
+    db.user.create({ data: { email: `${tag}-other@integration.invalid`, passwordHash: 'test-only', role: 'SHOP_OWNER' } }),
+    db.user.create({ data: { email: `${tag}-customer@integration.invalid`, passwordHash: 'test-only', role: 'CUSTOMER' } }),
+    db.user.create({ data: { email: `${tag}-agent@integration.invalid`, passwordHash: 'test-only', role: 'AGENT' } }),
+    db.user.create({ data: { email: `${tag}-contender@integration.invalid`, passwordHash: 'test-only', role: 'AGENT' } }),
+    db.user.create({ data: { email: `${tag}-admin@integration.invalid`, passwordHash: 'test-only', role: 'SUPER_ADMIN' } }),
+  ]);
+  userIds.push(owner.id, otherOwner.id, customer.id, agentUser.id, contenderUser.id, admin.id);
+  const [shop, otherShop] = await Promise.all([
+    db.shop.create({ data: { ownerId: owner.id, name: `${tag} shop`, slug: `${tag}-shop` } }),
+    db.shop.create({ data: { ownerId: otherOwner.id, name: `${tag} other`, slug: `${tag}-other` } }),
+  ]);
+  shopIds.push(shop.id, otherShop.id);
+  const printer = await db.printer.create({ data: { shopId: shop.id, name: `${tag} simulated printer`, queueName: `${tag}-queue`, status: 'UNKNOWN' } });
+  printerIds.push(printer.id);
+  await db.pricing.create({ data: { shopId: shop.id, paperSize: 'A4', color: true, pricePerPage: '5.00', colorSurcharge: '2.50', updatedAt: new Date() } });
+
+  const pdf = await PDFDocument.create();
+  pdf.addPage([612, 792]).drawText('QR Print database integration fixture');
+  const pdfBytes = await pdf.save();
+  const docId = randomUUID();
+  const storageKey = `${docId}.pdf`;
+  pdfPath = path.resolve('storage', storageKey);
+  await mkdir(path.dirname(pdfPath), { recursive: true });
+  await writeFile(pdfPath, pdfBytes);
+  const document = await db.document.create({ data: { id: docId, ownerId: customer.id, storageKey, mimeType: 'application/pdf', pageCount: 2 } });
+  documentIds.push(document.id);
+
+  const agentToken = mintAgentSecret();
+  const agent = await db.agentDevice.create({ data: { shopId: shop.id, printerId: printer.id, userId: agentUser.id, name: `${tag} agent`, deviceKeyHash: hashSecret(agentToken), mode: 'SIMULATED' } });
+  const contenderToken = mintAgentSecret();
+  const contender = await db.agentDevice.create({ data: { shopId: shop.id, printerId: printer.id, userId: contenderUser.id, name: `${tag} contender`, deviceKeyHash: hashSecret(contenderToken), mode: 'SIMULATED' } });
+  agentIds.push(agent.id, contender.id);
+  const customerAuth = `Bearer ${issueToken(customer.id, 'CUSTOMER')}`;
+  const ownerAuth = `Bearer ${issueToken(owner.id, 'SHOP_OWNER')}`;
+  const otherOwnerAuth = `Bearer ${issueToken(otherOwner.id, 'SHOP_OWNER')}`;
+  const adminAuth = `Bearer ${issueToken(admin.id, 'SUPER_ADMIN')}`;
+  const agentTokens = [agentToken, contenderToken];
+  const call = (route: string, init: RequestInit = {}) => fetch(`${baseUrl}${route}`, init);
+  const json = (body: unknown, authorization = customerAuth): RequestInit => ({ method: 'POST', headers: { authorization, 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const claimOne = async () => {
+    const responses = await Promise.all(agentTokens.map(token => call('/agent/jobs/claim', { method: 'POST', headers: { authorization: `Bearer ${token}` } })));
+    assert.ok(responses.every(response => response.status === 200));
+    const claims = await Promise.all(responses.map(response => response.json() as Promise<{ job: { id: string; leaseToken: string; attempt: number } | null }>));
+    const winners = claims.map((result, index) => ({ result, token: agentTokens[index]! })).filter(item => item.result.job !== null);
+    assert.equal(winners.length, 1, 'concurrent agents must yield exactly one database claim');
+    return { ...winners[0]!.result.job!, agentToken: winners[0]!.token };
+  };
+
+  const unauthenticated = await call(`/shops/${shop.id}/orders`);
+  assert.equal(unauthenticated.status, 401, 'shop orders require authentication');
+  const qr = await call(`/shops/${shop.slug}/qr.svg`);
+  assert.equal(qr.status, 200);
+  assert.match(qr.headers.get('content-type')||'',/image\/svg\+xml/);
+  assert.match(await qr.text(),/<svg/);
+  assert.equal(qr.headers.get('x-qr-public-url'),`http://localhost:3000/upload?shop=${shop.slug}`,'the QR exposes only the local public customer URL and shop slug');
+  const crossShop = await call(`/shops/${shop.id}/orders`, { headers: { authorization: otherOwnerAuth } });
+  assert.equal(crossShop.status, 404, 'another owner cannot read this shop');
+  assert.equal((await call('/customer/orders')).status,401,'customer order history requires authentication');
+  assert.equal((await call('/owner/shops',{headers:{authorization:customerAuth}})).status,403,'customer accounts cannot access shop-enrollment choices');
+  const ownerShopChoices=await call('/owner/shops',{headers:{authorization:ownerAuth}});
+  assert.equal(ownerShopChoices.status,200);
+  assert.deepEqual((await ownerShopChoices.json() as Array<{id:string}>).map(s=>s.id),[shop.id]);
+  assert.equal((await call('/admin/metrics',{headers:{authorization:ownerAuth}})).status,403,'shop owners cannot access platform metrics');
+  assert.equal((await call('/admin/platform-settings',{headers:{authorization:ownerAuth}})).status,403,'shop owners cannot alter platform commission settings');
+  assert.equal((await call('/admin/accounts/shop-owner',json({email:`${tag}-forbidden@integration.invalid`,password:'integration-password-123'},ownerAuth))).status,403,'shop owners cannot provision platform accounts');
+  const provisionedOwner=await call('/admin/accounts/shop-owner',json({email:`${tag}-provisioned@integration.invalid`,password:'integration-password-123'},adminAuth));
+  assert.equal(provisionedOwner.status,201);
+  const provisionedOwnerRecord=await provisionedOwner.json() as {id:string;role:string};
+  userIds.push(provisionedOwnerRecord.id);
+  assert.equal(provisionedOwnerRecord.role,'SHOP_OWNER');
+  const ownerPrinters=await call(`/shops/${shop.id}/printers`,{headers:{authorization:ownerAuth}});
+  assert.equal(ownerPrinters.status,200);
+  assert.equal((await ownerPrinters.json() as unknown[]).length,1);
+  assert.equal((await call(`/shops/${shop.id}/printers`,{headers:{authorization:otherOwnerAuth}})).status,404,'printer routes are tenant scoped');
+  const crossAgent = await call('/agent/jobs/claim', { method: 'POST' });
+  assert.equal(crossAgent.status, 401, 'agent routes reject missing device credentials');
+  const capabilities={source:'WINDOWS_DRIVER_QUEUE',supportsColor:false,canDuplex:false,paperSizes:['Letter'],resolutions:['Draft:300x300dpi']};
+  const initialHeartbeat=await call('/agent/heartbeat',{...json({observedQueue:{name:printer.queueName,installedQueue:true,available:true,status:'DRIVER_REPORTED_READY',capabilities}},`Bearer ${agentToken}`)});
+  assert.equal(initialHeartbeat.status,200);
+  const agentStatus=await call(`/shops/${shop.id}/agents`,{headers:{authorization:ownerAuth}});
+  assert.equal(agentStatus.status,200);
+  const listedAgents=await agentStatus.json() as Array<{id:string;isConnected:boolean;printer:{capabilities:unknown}|null}>;
+  assert.equal(listedAgents.find(a=>a.id===agent.id)?.isConnected,true);
+  assert.deepEqual(listedAgents.find(a=>a.id===agent.id)?.printer?.capabilities,capabilities);
+
+  const created = await call('/orders', json({ shopId: shop.id, documentId: document.id, copies: 3, paperSize: 'A4', color: true, idempotencyKey: `${tag}-order-one` }));
+  assert.equal(created.status, 201);
+  const order = await created.json() as { id: string; total: string; status: string };
+  orderIds.push(order.id); auditTargetIds.push(order.id);
+  assert.equal(Number(order.total), 45, 'server calculates two pages × three copies × (5 + 2.50)');
+  assert.equal(order.status, 'OPEN');
+  const replay = await call('/orders', json({ shopId: shop.id, documentId: document.id, copies: 3, paperSize: 'A4', color: true, idempotencyKey: `${tag}-order-one` }));
+  assert.equal(replay.status, 200, 'same-customer idempotency replays the persisted order');
+  assert.equal((await replay.json() as { id: string }).id, order.id);
+
+  const pendingPay = await call(`/orders/${order.id}/pay`, { ...json({}) });
+  assert.equal(pendingPay.status, 200);
+  const pendingPayment = await pendingPay.json() as { id: string; status: string; note: string; developmentOnly: boolean };
+  paymentIds.push(pendingPayment.id);
+  assert.equal(pendingPayment.status, 'PENDING');
+  assert.equal(pendingPayment.note, 'mock-development-only');
+  assert.equal(pendingPayment.developmentOnly, true);
+  const blockedQueue = await call(`/orders/${order.id}/queue`, json({ printerId: printer.id }, ownerAuth));
+  assert.equal(blockedQueue.status, 402, 'pending mock payment cannot enter queue');
+  const verified = await call(`/payments/${pendingPayment.id}/verify`, json({}));
+  assert.equal(verified.status, 200);
+  const verification = await verified.json() as { orderStatus: string; payment: { status: string } };
+  assert.equal(verification.payment.status, 'VERIFIED');
+  assert.equal(verification.orderStatus, 'OPEN', 'payment verification does not advance order or print state');
+  const queuedResponse = await call(`/orders/${order.id}/queue`, json({ printerId: printer.id }, ownerAuth));
+  assert.equal(queuedResponse.status, 202);
+  const queued = await queuedResponse.json() as { job: { id: string; status: string; mode: string; physicalStatus: string }; physicalPrintConfirmed: boolean };
+  jobIds.push(queued.job.id); auditTargetIds.push(queued.job.id);
+  assert.equal(queued.job.status, 'QUEUED');
+  assert.equal(queued.job.mode, 'SIMULATED');
+  assert.equal(queued.job.physicalStatus, 'NOT_SUBMITTED');
+  assert.equal(queued.physicalPrintConfirmed, false);
+
+  const claimed = await claimOne();
+  assert.equal(claimed.id, queued.job.id);
+  const leaseHeader = { authorization: `Bearer ${claimed.agentToken}`, 'x-job-lease': claimed.leaseToken };
+  const download = await call(`/agent/jobs/${queued.job.id}/document`, { headers: leaseHeader });
+  assert.equal(download.status, 200);
+  assert.equal(download.headers.get('content-type'), 'application/pdf');
+  const localJobState=await call(`/agent/jobs/${queued.job.id}/state`,{headers:leaseHeader});
+  assert.equal(localJobState.status,200);
+  const localState=await localJobState.json() as {status:string;leaseOwned:boolean};
+  assert.equal(localState.status,'DOWNLOADED');
+  assert.equal(localState.leaseOwned,true);
+  const submittingBody = { eventKey: `${tag}-submit-event`, status: 'SUBMITTING', leaseToken: claimed.leaseToken };
+  const submitting = await call(`/agent/jobs/${queued.job.id}/status`, json(submittingBody, leaseHeader.authorization));
+  assert.equal(submitting.status, 200);
+  const duplicateEvent = await call(`/agent/jobs/${queued.job.id}/status`, json(submittingBody, leaseHeader.authorization));
+  assert.equal(duplicateEvent.status, 200);
+  assert.equal((await duplicateEvent.json() as { idempotentReplay: boolean }).idempotentReplay, true);
+  await db.printJob.update({ where: { id: queued.job.id }, data: { leaseExpiresAt: new Date(Date.now() - 1000) } });
+  const heartbeat = await call('/agent/heartbeat', { method: 'POST', headers: { ...leaseHeader, 'content-type': 'application/json' }, body: JSON.stringify({}) });
+  assert.equal(heartbeat.status, 200);
+  const unknown = await db.printJob.findUniqueOrThrow({ where: { id: queued.job.id }, include: { order: { include: { payment: true } } } });
+  assert.equal(unknown.status, 'OUTCOME_UNKNOWN', 'expired in-submission lease is not blindly retried');
+  assert.equal(unknown.physicalStatus, 'UNKNOWN');
+  assert.equal(unknown.order.status, 'OPEN');
+  assert.equal(unknown.order.payment?.status, 'VERIFIED');
+  const unsafeRetry = await call(`/shops/${shop.id}/jobs/${queued.job.id}/reconcile`, json({ decision: 'retry' }, ownerAuth));
+  assert.equal(unsafeRetry.status, 409, 'outcome-unknown job cannot be retried before operator reconciliation');
+
+  const retryOrderResponse = await call('/orders', json({ shopId: shop.id, documentId: document.id, copies: 1, paperSize: 'A4', color: true, idempotencyKey: `${tag}-order-two` }));
+  assert.equal(retryOrderResponse.status, 201);
+  const retryOrder = await retryOrderResponse.json() as { id: string };
+  orderIds.push(retryOrder.id); auditTargetIds.push(retryOrder.id);
+  const retryPayResponse = await call(`/orders/${retryOrder.id}/pay`, json({}));
+  const retryPay = await retryPayResponse.json() as { id: string };
+  paymentIds.push(retryPay.id);
+  const retryVerify = await call(`/payments/${retryPay.id}/verify`, json({}));
+  assert.equal(retryVerify.status, 200);
+  const retryQueueResponse = await call(`/orders/${retryOrder.id}/queue`, json({ printerId: printer.id }, ownerAuth));
+  assert.equal(retryQueueResponse.status, 202);
+  const retryQueued = await retryQueueResponse.json() as { job: { id: string } };
+  jobIds.push(retryQueued.job.id); auditTargetIds.push(retryQueued.job.id);
+  const claimedRetry = await claimOne();
+  assert.equal(claimedRetry.id, retryQueued.job.id);
+  const retryLeaseHeaders = { authorization: `Bearer ${claimedRetry.agentToken}`, 'x-job-lease': claimedRetry.leaseToken };
+  assert.equal((await call(`/agent/jobs/${retryQueued.job.id}/document`, { headers: retryLeaseHeaders })).status, 200);
+  const safeFailure = await call(`/agent/jobs/${retryQueued.job.id}/status`, json({ eventKey: `${tag}-failed-event`, status: 'FAILED', leaseToken: claimedRetry.leaseToken, error: 'simulated test failure' }, retryLeaseHeaders.authorization));
+  assert.equal(safeFailure.status, 200);
+  const requeue = await call(`/shops/${shop.id}/jobs/${retryQueued.job.id}/reconcile`, json({ decision: 'retry' }, ownerAuth));
+  assert.equal(requeue.status, 202, 'safely failed job may be retried within its attempt limit');
+  await db.printJob.update({ where: { id: retryQueued.job.id }, data: { nextAttemptAt: new Date(Date.now() - 1000) } });
+  const reclaimed = await claimOne();
+  assert.equal(reclaimed.id, retryQueued.job.id);
+  assert.equal(reclaimed.attempt, 2, 'retry increments the persistent attempt count');
+  await db.printJob.update({ where: { id: retryQueued.job.id }, data: { leaseExpiresAt: new Date(Date.now() - 1000) } });
+  const safeLeaseReclaim = await claimOne();
+  assert.equal(safeLeaseReclaim.id, retryQueued.job.id);
+  assert.equal(safeLeaseReclaim.attempt, 3, 'an expired pre-submission lease is safely requeued and counted');
+  const finalLeaseHeaders = { authorization: `Bearer ${safeLeaseReclaim.agentToken}`, 'x-job-lease': safeLeaseReclaim.leaseToken };
+  assert.equal((await call(`/agent/jobs/${retryQueued.job.id}/document`, { headers: finalLeaseHeaders })).status, 200);
+  assert.equal((await call(`/agent/jobs/${retryQueued.job.id}/status`, json({ eventKey: `${tag}-final-submit`, status: 'SUBMITTING', leaseToken: safeLeaseReclaim.leaseToken }, finalLeaseHeaders.authorization))).status, 200);
+  const simulatedResult = await call(`/agent/jobs/${retryQueued.job.id}/status`, json({ eventKey: `${tag}-simulated-done`, status: 'SIMULATED_COMPLETE', leaseToken: safeLeaseReclaim.leaseToken }, finalLeaseHeaders.authorization));
+  assert.equal(simulatedResult.status, 200);
+  const simulatedBody = await simulatedResult.json() as { physicalStatus: string; physicalPrintConfirmed: boolean };
+  assert.equal(simulatedBody.physicalStatus, 'SIMULATED_ONLY');
+  assert.equal(simulatedBody.physicalPrintConfirmed, false, 'simulated completion never claims physical output');
+
+  const customerHistory=await call('/customer/orders',{headers:{authorization:customerAuth}});
+  assert.equal(customerHistory.status,200);
+  const customerOrders=await customerHistory.json() as Array<{id:string;payment:{status:string}|null;printJob:{status:string;physicalStatus:string}|null}>;
+  assert.deepEqual(new Set(customerOrders.map(o=>o.id)),new Set(orderIds),'customers see only their own orders');
+  assert.equal(customerOrders.find(o=>o.id===order.id)?.payment?.status,'VERIFIED');
+  assert.equal(customerOrders.find(o=>o.id===order.id)?.printJob?.physicalStatus,'UNKNOWN','customer history separates physical outcome');
+  const metrics=await call('/admin/metrics',{headers:{authorization:adminAuth}});
+  assert.equal(metrics.status,200);
+  const metricData=await metrics.json() as {developmentOnly:boolean;commissionBasisPoints:number;estimatedCommission:string};
+  assert.equal(metricData.developmentOnly,true);
+  assert.equal(metricData.commissionBasisPoints,0);
+  assert.equal(metricData.estimatedCommission,'0.00');
+  const priorPlatformSetting=await db.platformSetting.findUnique({where:{id:'platform'}});
+  try{
+    const updateCommission=await call('/admin/platform-settings',{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({commissionBasisPoints:375})});
+    assert.equal(updateCommission.status,200);
+    const changedSetting=await call('/admin/platform-settings',{headers:{authorization:adminAuth}});
+    assert.equal((await changedSetting.json() as {commissionBasisPoints:number}).commissionBasisPoints,375);
+  }finally{
+    if(priorPlatformSetting)await db.platformSetting.upsert({where:{id:'platform'},create:priorPlatformSetting,update:{commissionBasisPoints:priorPlatformSetting.commissionBasisPoints}});
+    else await db.platformSetting.deleteMany({where:{id:'platform'}});
+  }
+  const deactivated=await call(`/admin/shops/${shop.id}/active`,{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({isActive:false})});
+  assert.equal(deactivated.status,200);
+  assert.equal((await call(`/shops/${shop.slug}`)).status,404,'deactivated shop is no longer publicly listed');
+  const reactivated=await call(`/admin/shops/${shop.id}/active`,{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({isActive:true})});
+  assert.equal(reactivated.status,200);
+
+  // Verify the second shop remains isolated from the fixture order set.
+  const ownerOrders = await call(`/shops/${shop.id}/orders`, { headers: { authorization: ownerAuth } });
+  assert.equal(ownerOrders.status, 200);
+  const visible = await ownerOrders.json() as Array<{ id: string }>;
+  assert.deepEqual(new Set(visible.map(x => x.id)), new Set(orderIds));
+  const otherOrders = await call(`/shops/${otherShop.id}/orders`, { headers: { authorization: otherOwnerAuth } });
+  assert.equal(otherOrders.status, 200);
+  assert.equal((await otherOrders.json() as unknown[]).length, 0);
+  const crossShopRevoke=await call(`/shops/${otherShop.id}/agents/${contender.id}/revoke`,json({},otherOwnerAuth));
+  assert.equal(crossShopRevoke.status,404,'an owner cannot revoke another shop agent');
+  const revoked=await call(`/shops/${shop.id}/agents/${contender.id}/revoke`,json({},ownerAuth));
+  assert.equal(revoked.status,200);
+  const revokedHeartbeat=await call('/agent/heartbeat',{...json({},`Bearer ${contenderToken}`)});
+  assert.equal(revokedHeartbeat.status,401,'rotating the stored credential revokes the previous one-time secret');
+});
