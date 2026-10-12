@@ -19,14 +19,15 @@ public sealed class AgentApiClient : IDisposable {
         if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
+    private static readonly JsonSerializerOptions JsonOptions=new(){DefaultIgnoreCondition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull};
     public async Task<JsonDocument> PostAsync(string route,object body,CancellationToken ct=default) {
-        using var response=await client.PostAsync(route,new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json"),ct);
+        using var response=await client.PostAsync(route,new StringContent(JsonSerializer.Serialize(body,JsonOptions),Encoding.UTF8,"application/json"),ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
         if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<JsonDocument> PutAsync(string route,object body,CancellationToken ct=default) {
-        using var response=await client.PutAsync(route,new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json"),ct);
+        using var response=await client.PutAsync(route,new StringContent(JsonSerializer.Serialize(body,JsonOptions),Encoding.UTF8,"application/json"),ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
         if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);

@@ -317,7 +317,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   const localState=await localJobState.json() as {status:string;leaseOwned:boolean};
   assert.equal(localState.status,'DOWNLOADED');
   assert.equal(localState.leaseOwned,true);
-  const submittingBody = { eventKey: `${tag}-submit-event`, status: 'SUBMITTING', leaseToken: claimed.leaseToken };
+  const submittingBody = { eventKey: `${tag}-submit-event`, status: 'SUBMITTING', leaseToken: claimed.leaseToken, error: null, externalJobId: null };
   const submitting = await call(`/agent/jobs/${queued.job.id}/status`, json(submittingBody, leaseHeader.authorization));
   assert.equal(submitting.status, 200);
   const duplicateEvent = await call(`/agent/jobs/${queued.job.id}/status`, json(submittingBody, leaseHeader.authorization));
