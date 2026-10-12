@@ -35,6 +35,7 @@ export function createAgentRouter(db:PrismaClient){
   const agent=req.agent!,now=new Date(),expires=new Date(now.getTime()+leaseSeconds*1000);
   let token='';
   const skipped=new Set<string>();
+  let raceLostCount=0;
   const connectedDevices=await db.agentDevice.findMany({where:{shopId:agent.shopId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{printerId:true}});
   const connectedPrinterIds=new Set(connectedDevices.flatMap(device=>device.printerId?[device.printerId]:[]));
   const canAdoptPrinter=(printerId:string|null,printerShopId:string|undefined)=>printerId===null||(printerShopId===agent.shopId&&!connectedPrinterIds.has(printerId));
@@ -58,7 +59,7 @@ export function createAgentRouter(db:PrismaClient){
      if(candidates.length<25)return undefined;
     }
    },
-   claimIfQueued:async(candidate:{id:string;orderId:string;printerId:string|null;printer:{shopId:string}|null})=>{
+   claimIfQueued:async(candidate:{id:string;orderId:string;printerId:string|null;mode:string;attempt:number;maxAttempts:number;nextAttemptAt:Date|null;printer:{shopId:string}|null})=>{
     if(candidate.printerId!==agent.printerId&&candidate.printerId!==null){
      const oldPrinterStillConnected=await db.agentDevice.findFirst({where:{shopId:agent.shopId,printerId:candidate.printerId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{id:true}});
      if(candidate.printer?.shopId!==agent.shopId||oldPrinterStillConnected){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PRINTER_MISMATCH'});return undefined;}
@@ -70,7 +71,7 @@ export function createAgentRouter(db:PrismaClient){
      where:{id:candidate.id,printerId:candidate.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],order:{shopId:agent.shopId}},
      data:{printerId:agent.printerId,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
     });
-    if(!updated.count){skipped.add(candidate.id);log('info','agent.job.claim.race_lost',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id});}
+    if(!updated.count){skipped.add(candidate.id);raceLostCount++;log('info','agent.job.claim.race_lost',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,candidatePrinterId:candidate.printerId,candidateMode:candidate.mode,attempt:candidate.attempt,maxAttempts:candidate.maxAttempts,nextAttemptAt:candidate.nextAttemptAt?.toISOString()??null});}
     return updated.count?candidate:undefined;
    },
   });
@@ -91,9 +92,9 @@ export function createAgentRouter(db:PrismaClient){
     if(examples.length<10)examples.push({jobId:job.id,reason,...(job.order.payment?.status?{paymentStatus:job.order.payment.status}:{})});
    }
    if(!queuedCount)reasons.NO_QUEUED_JOBS=1;
-   const diagnostics={agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode,queueName:agent.queueName,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,reasons,examples};
+   const diagnostics={agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode,queueName:agent.queueName,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,raceLostCandidates:raceLostCount,reasons,examples};
    log('warn','agent.job.claim.empty',diagnostics);
-   return res.json({job:null,leaseSeconds,diagnostics:{queueName:agent.queueName,mode:agent.mode,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,reasons,examples}});
+   return res.json({job:null,leaseSeconds,diagnostics:{queueName:agent.queueName,mode:agent.mode,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,raceLostCandidates:raceLostCount,reasons,examples}});
   }
   const job=await db.printJob.findUniqueOrThrow({where:{id:claimed.id},include:{order:{include:{document:true,payment:true}}}});
   log('info','agent.job.claimed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,attempt:job.attempt,paymentStatus:job.order.payment?.status});

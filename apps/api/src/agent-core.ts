@@ -21,4 +21,4 @@ export function claimSkipReason(job:{printerId:string|null;mode:string;attempt:n
 export function resolveAgentEvent(prior:{agentDeviceId:string;eventType:string}|null,agentDeviceId:string,eventType:string):'NEW'|'REPLAY'|'CONFLICT'{if(!prior)return 'NEW';return prior.agentDeviceId===agentDeviceId&&prior.eventType===eventType?'REPLAY':'CONFLICT';}
 
 export interface ClaimRepository<T>{candidate():Promise<T|undefined>;claimIfQueued(candidate:T):Promise<T|undefined>}
-export async function atomicClaimNext<T>(repo:ClaimRepository<T>,maxTries=3):Promise<T|undefined>{for(let i=0;i<maxTries;i++){const candidate=await repo.candidate();if(!candidate)return undefined;const claimed=await repo.claimIfQueued(candidate);if(claimed)return claimed;}return undefined;}
+export async function atomicClaimNext<T>(repo:ClaimRepository<T>):Promise<T|undefined>{while(true){const candidate=await repo.candidate();if(!candidate)return undefined;const claimed=await repo.claimIfQueued(candidate);if(claimed)return claimed;}}
