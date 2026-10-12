@@ -17,11 +17,11 @@
     "test": "npm --workspaces run test",
     "test:integration": "npm --workspace @qr-print/api run test:integration",
     "db:check-target": "npm --workspace @qr-print/api run db:check-target",
-    "db:migrate": "npm --workspace @qr-print/api run db:migrate",
-    "db:migrate:test": "npm --workspace @qr-print/api run db:migrate:test",
     "db:generate": "npm --workspace @qr-print/api run db:generate",
     "db:seed": "npm --workspace @qr-print/api run db:seed",
-    "agent:sim": "dotnet run --project apps/windows-agent -- --mode simulated"
+    "agent:sim": "dotnet run --project apps/windows-agent -- --mode simulated",
+    "db:push": "npm --workspace @qr-print/api run db:push",
+    "db:push:test": "npm --workspace @qr-print/api run db:push:test"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

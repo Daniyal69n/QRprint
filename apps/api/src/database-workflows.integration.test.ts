@@ -9,16 +9,13 @@ import { PrismaClient } from '@prisma/client';
 import { issueToken } from './auth.js';
 import { hashSecret, mintAgentSecret } from './agent-core.js';
 import { createApp } from './app.js';
+import { assertDatabaseTarget } from './database-target.js';
 
 const db = new PrismaClient();
-const testUrl = process.env.DATABASE_URL;
-const parsedTestUrl = testUrl ? new URL(testUrl) : undefined;
-if (!parsedTestUrl || !['postgres:', 'postgresql:'].includes(parsedTestUrl.protocol) || decodeURIComponent(parsedTestUrl.pathname.slice(1)) !== 'qr_print_test') {
-  throw new Error('Integration tests refuse any DATABASE_URL other than qr_print_test.');
-}
+assertDatabaseTarget(process.env.MONGODB_URI, 'qr_print_test');
 const actualDatabase = async () => {
-  const rows = await db.$queryRaw<Array<{ name: string }>>`SELECT current_database() AS name`;
-  assert.equal(rows[0]?.name, 'qr_print_test', 'PostgreSQL must confirm qr_print_test before fixtures or cleanup');
+  const result = await db.$runCommandRaw({ ping: 1 });
+  assert.equal(Number(result.ok), 1, 'MongoDB must confirm a successful ping before fixtures or cleanup');
 };
 
 const tag = `qr-it-${randomUUID()}`;
@@ -82,7 +79,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   shopIds.push(shop.id, otherShop.id);
   const printer = await db.printer.create({ data: { shopId: shop.id, name: `${tag} simulated printer`, queueName: `${tag}-queue`, status: 'UNKNOWN' } });
   printerIds.push(printer.id);
-  await db.pricing.create({ data: { shopId: shop.id, paperSize: 'A4', color: true, pricePerPage: '5.00', colorSurcharge: '2.50', updatedAt: new Date() } });
+  await db.pricing.create({ data: { shopId: shop.id, paperSize: 'A4', color: true, pricePerPage: 5, colorSurcharge: 2.5, updatedAt: new Date() } });
 
   const pdf = await PDFDocument.create();
   pdf.addPage([612, 792]).drawText('QR Print database integration fixture');
@@ -153,7 +150,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   assert.equal((await call(`/shops/${shop.id}/printers`,{headers:{authorization:otherOwnerAuth}})).status,404,'printer routes are tenant scoped');
   const crossAgent = await call('/agent/jobs/claim', { method: 'POST' });
   assert.equal(crossAgent.status, 401, 'agent routes reject missing device credentials');
-  const capabilities={source:'WINDOWS_DRIVER_QUEUE',supportsColor:false,canDuplex:false,paperSizes:['Letter'],resolutions:['Draft:300x300dpi']};
+  let capabilities={source:'WINDOWS_DRIVER_QUEUE',supportsColor:false,canDuplex:false,paperSizes:['Letter'],resolutions:['Draft:300x300dpi']};
   const initialHeartbeat=await call('/agent/heartbeat',{...json({observedQueue:{name:printer.queueName,installedQueue:true,available:true,status:'DRIVER_REPORTED_READY',capabilities}},`Bearer ${agentToken}`)});
   assert.equal(initialHeartbeat.status,200);
   const agentStatus=await call(`/shops/${shop.id}/agents`,{headers:{authorization:ownerAuth}});
@@ -161,6 +158,16 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   const listedAgents=await agentStatus.json() as Array<{id:string;isConnected:boolean;printer:{capabilities:unknown}|null}>;
   assert.equal(listedAgents.find(a=>a.id===agent.id)?.isConnected,true);
   assert.deepEqual(listedAgents.find(a=>a.id===agent.id)?.printer?.capabilities,capabilities);
+  const rejectedDuplexSetting=await call(`/shops/${shop.id}/settings`,{method:'PUT',headers:{authorization:ownerAuth,'content-type':'application/json'},body:JSON.stringify({supportsDuplex:true})});
+  assert.equal(rejectedDuplexSetting.status,409,'a shop cannot enable duplex unless a registered driver reports it');
+  capabilities={...capabilities,canDuplex:true};
+  const duplexHeartbeat=await call('/agent/heartbeat',{...json({observedQueue:{name:printer.queueName,installedQueue:true,available:true,status:'DRIVER_REPORTED_READY',capabilities}},`Bearer ${agentToken}`)});
+  assert.equal(duplexHeartbeat.status,200);
+  const enabledDuplex=await call(`/shops/${shop.id}/settings`,{method:'PUT',headers:{authorization:ownerAuth,'content-type':'application/json'},body:JSON.stringify({supportsDuplex:true})});
+  assert.equal(enabledDuplex.status,200);
+  const shopPrintOptions=await call(`/shops/${shop.slug}/print-options`);
+  assert.equal(shopPrintOptions.status,200);
+  assert.equal((await shopPrintOptions.json() as {supportsDuplex:boolean}).supportsDuplex,true);
 
   const created = await call('/orders', json({ shopId: shop.id, documentId: document.id, copies: 3, paperSize: 'A4', color: true, idempotencyKey: `${tag}-order-one` }));
   assert.equal(created.status, 201);
@@ -168,6 +175,9 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   orderIds.push(order.id); auditTargetIds.push(order.id);
   assert.equal(Number(order.total), 45, 'server calculates two pages × three copies × (5 + 2.50)');
   assert.equal(order.status, 'OPEN');
+  const selectedDuplex=await call(`/orders/${order.id}/print-options`,json({doubleSided:true}));
+  assert.equal(selectedDuplex.status,200);
+  assert.equal((await selectedDuplex.json() as {doubleSided:boolean}).doubleSided,true);
   const replay = await call('/orders', json({ shopId: shop.id, documentId: document.id, copies: 3, paperSize: 'A4', color: true, idempotencyKey: `${tag}-order-one` }));
   assert.equal(replay.status, 200, 'same-customer idempotency replays the persisted order');
   assert.equal((await replay.json() as { id: string }).id, order.id);
@@ -186,6 +196,13 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   const verification = await verified.json() as { orderStatus: string; payment: { status: string } };
   assert.equal(verification.payment.status, 'VERIFIED');
   assert.equal(verification.orderStatus, 'OPEN', 'payment verification does not advance order or print state');
+  capabilities={...capabilities,canDuplex:false};
+  const noDuplexHeartbeat=await call('/agent/heartbeat',{...json({observedQueue:{name:printer.queueName,installedQueue:true,available:true,status:'DRIVER_REPORTED_READY',capabilities}},`Bearer ${agentToken}`)});
+  assert.equal(noDuplexHeartbeat.status,200);
+  const blockedDuplexQueue=await call(`/orders/${order.id}/queue`,json({printerId:printer.id},ownerAuth));
+  assert.equal(blockedDuplexQueue.status,409,'a duplex order cannot use a driver that no longer reports duplex support');
+  capabilities={...capabilities,canDuplex:true};
+  await call('/agent/heartbeat',{...json({observedQueue:{name:printer.queueName,installedQueue:true,available:true,status:'DRIVER_REPORTED_READY',capabilities}},`Bearer ${agentToken}`)});
   const queuedResponse = await call(`/orders/${order.id}/queue`, json({ printerId: printer.id }, ownerAuth));
   assert.equal(queuedResponse.status, 202);
   const queued = await queuedResponse.json() as { job: { id: string; status: string; mode: string; physicalStatus: string }; physicalPrintConfirmed: boolean };
@@ -198,6 +215,8 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   const claimed = await claimOne();
   assert.equal(claimed.id, queued.job.id);
   const leaseHeader = { authorization: `Bearer ${claimed.agentToken}`, 'x-job-lease': claimed.leaseToken };
+  const leasedPrintOptions=await call(`/agent/jobs/${queued.job.id}/print-options`,{headers:leaseHeader});
+  assert.equal((await leasedPrintOptions.json() as {doubleSided:boolean}).doubleSided,true);
   const download = await call(`/agent/jobs/${queued.job.id}/document`, { headers: leaseHeader });
   assert.equal(download.status, 200);
   assert.equal(download.headers.get('content-type'), 'application/pdf');
@@ -263,9 +282,10 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
 
   const customerHistory=await call('/customer/orders',{headers:{authorization:customerAuth}});
   assert.equal(customerHistory.status,200);
-  const customerOrders=await customerHistory.json() as Array<{id:string;payment:{status:string}|null;printJob:{status:string;physicalStatus:string}|null}>;
+  const customerOrders=await customerHistory.json() as Array<{id:string;doubleSided:boolean;payment:{status:string}|null;printJob:{status:string;physicalStatus:string}|null}>;
   assert.deepEqual(new Set(customerOrders.map(o=>o.id)),new Set(orderIds),'customers see only their own orders');
   assert.equal(customerOrders.find(o=>o.id===order.id)?.payment?.status,'VERIFIED');
+  assert.equal(customerOrders.find(o=>o.id===order.id)?.doubleSided,true);
   assert.equal(customerOrders.find(o=>o.id===order.id)?.printJob?.physicalStatus,'UNKNOWN','customer history separates physical outcome');
   const metrics=await call('/admin/metrics',{headers:{authorization:adminAuth}});
   assert.equal(metrics.status,200);
@@ -273,6 +293,45 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   assert.equal(metricData.developmentOnly,true);
   assert.equal(metricData.commissionBasisPoints,0);
   assert.equal(metricData.estimatedCommission,'0.00');
+  const priorManualSetting=await db.platformSetting.findUnique({where:{id:'platform'}});
+  try{
+    assert.equal((await call('/admin/manual-payment-settings',{headers:{authorization:ownerAuth}})).status,403,'shop owners cannot read or manage platform transfer settings');
+    const configureManual=await call('/admin/manual-payment-settings',json({enabled:true,provider:'Test bank',accountName:'QR Print Test',accountNumber:'123456789',instructions:'Use the order number as the transfer note.'},adminAuth));
+    assert.equal(configureManual.status,200);
+    const manualOrderResponse=await call('/orders',json({shopId:shop.id,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-manual-order`}));
+    assert.equal(manualOrderResponse.status,201);
+    const manualOrder=await manualOrderResponse.json() as {id:string};
+    orderIds.push(manualOrder.id);auditTargetIds.push(manualOrder.id);
+    const manualPayResponse=await call(`/orders/${manualOrder.id}/pay`,json({}));
+    assert.equal(manualPayResponse.status,200);
+    const manualPay=await manualPayResponse.json() as {id:string;status:string;provider:string;manualPayment:{provider:string;accountName:string;accountNumber:string}};
+    paymentIds.push(manualPay.id);
+    assert.equal(manualPay.provider,'manual-transfer');
+    assert.equal(manualPay.status,'PENDING');
+    assert.equal(manualPay.manualPayment.accountNumber,'123456789');
+    const manualHistory=await call('/customer/orders',{headers:{authorization:customerAuth}});
+    assert.equal(manualHistory.status,200);
+    const manualOrderView=(await manualHistory.json() as Array<{id:string;payment:{manualPayment:{accountName:string}|null}|null}>).find(item=>item.id===manualOrder.id);
+    assert.equal(manualOrderView?.payment?.manualPayment?.accountName,'QR Print Test','pending transfer instructions remain available in customer order history');
+    assert.equal((await call(`/orders/${manualOrder.id}/queue`,json({printerId:printer.id},ownerAuth))).status,402,'manual transfer cannot queue before shop verification');
+    assert.equal((await call(`/payments/${manualPay.id}/verify`,json({}))).status,400,'customer verification cannot auto-approve a manual transfer');
+    const submitted=await call(`/payments/${manualPay.id}/submit`,json({reference:'TXN-445566'}));
+    assert.equal(submitted.status,200);
+    assert.equal((await submitted.json() as {payment:{status:string}}).payment.status,'SUBMITTED');
+    assert.equal((await call(`/payments/${manualPay.id}/submit`,json({reference:'TXN-445566'}))).status,200,'repeated customer submission is idempotent');
+    assert.equal((await call(`/orders/${manualOrder.id}/queue`,json({printerId:printer.id},ownerAuth))).status,402,'customer-submitted transfer still cannot queue');
+    assert.equal((await call(`/payments/${manualPay.id}/approve`,json({},otherOwnerAuth))).status,404,'another shop owner cannot confirm this transfer');
+    const confirmed=await call(`/payments/${manualPay.id}/approve`,json({},ownerAuth));
+    assert.equal(confirmed.status,200);
+    assert.equal((await confirmed.json() as {payment:{status:string}}).payment.status,'VERIFIED');
+    const authorizedQueue=await call(`/orders/${manualOrder.id}/queue`,json({printerId:printer.id},ownerAuth));
+    assert.equal(authorizedQueue.status,202,'shop confirmation authorizes the order for queuing');
+    const manualJob=await authorizedQueue.json() as {job:{id:string}};
+    jobIds.push(manualJob.job.id);
+  }finally{
+    if(priorManualSetting)await db.platformSetting.update({where:{id:'platform'},data:{manualPaymentEnabled:priorManualSetting.manualPaymentEnabled,manualPaymentProvider:priorManualSetting.manualPaymentProvider,manualPaymentAccountName:priorManualSetting.manualPaymentAccountName,manualPaymentAccountNumber:priorManualSetting.manualPaymentAccountNumber,manualPaymentInstructions:priorManualSetting.manualPaymentInstructions}});
+    else await db.platformSetting.deleteMany({where:{id:'platform'}});
+  }
   const priorPlatformSetting=await db.platformSetting.findUnique({where:{id:'platform'}});
   try{
     const updateCommission=await call('/admin/platform-settings',{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({commissionBasisPoints:375})});
@@ -303,4 +362,9 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   assert.equal(revoked.status,200);
   const revokedHeartbeat=await call('/agent/heartbeat',{...json({},`Bearer ${contenderToken}`)});
   assert.equal(revokedHeartbeat.status,401,'rotating the stored credential revokes the previous one-time secret');
+  const pausedOwner=await call(`/admin/accounts/${owner.id}/active`,{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({isActive:false})});
+  assert.equal(pausedOwner.status,200);
+  assert.equal((await call(`/shops/${shop.id}/orders`,{headers:{authorization:ownerAuth}})).status,401,'paused accounts cannot reuse previously issued owner tokens');
+  const resumedOwner=await call(`/admin/accounts/${owner.id}/active`,{method:'PUT',headers:{authorization:adminAuth,'content-type':'application/json'},body:JSON.stringify({isActive:true})});
+  assert.equal(resumedOwner.status,200);
 });

@@ -2,37 +2,32 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { config } from 'dotenv';
 import { PrismaClient } from '@prisma/client';
+import { assertMongoDatabaseTarget } from './mongodb-target.mjs';
 
 const workspace = process.cwd();
 const root = path.resolve(workspace, '../..');
 config({ path: path.join(root, '.env') });
 config({ path: path.join(workspace, '.env') });
-const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error('Refusing Prisma command: DATABASE_URL is not configured.');
-let target;
-try {
-  const parsed = new URL(databaseUrl);
-  if (!['postgres:', 'postgresql:'].includes(parsed.protocol)) throw new Error();
-  target = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
-} catch {
-  throw new Error('Refusing Prisma command: DATABASE_URL target could not be safely verified.');
+const uri = process.env.MONGODB_URI;
+assertMongoDatabaseTarget(uri, 'qr_print');
+const args = process.argv.slice(2);
+const generate = args[0] === 'generate';
+const push = args[0] === 'db' && args[1] === 'push';
+if ((!generate && !push) || args.some((arg) => ['--force-reset', '--accept-data-loss'].includes(arg))) {
+  throw new Error('Only Prisma generate and db push are enabled for MongoDB; destructive options are disabled.');
 }
-if (target !== 'qr_print') throw new Error(`Refusing Prisma command: expected database qr_print, configured target is ${target}.`);
-const forwarded = process.argv.slice(2);
-if (forwarded.some((arg) => ['reset', '--force-reset', '--accept-data-loss'].includes(arg)) || (forwarded[0] === 'db' && forwarded[1] === 'push')) {
-  throw new Error('Destructive Prisma commands are disabled by the QR Print wrapper.');
-}
-if (forwarded[0] === 'migrate' && !['deploy', 'status'].includes(forwarded[1])) {
-  throw new Error('Only Prisma migrate deploy/status commands are enabled by the QR Print wrapper.');
-}
-if (forwarded[0] === 'migrate' && forwarded[1] === 'deploy') {
-  const db = new PrismaClient({ datasources: { db: { url: databaseUrl } } });
+
+if (push) {
+  const db = new PrismaClient({ datasources: { db: { url: uri } } });
   try {
-    const rows = await db.$queryRaw`SELECT current_database() AS name`;
-    if (rows[0]?.name !== 'qr_print') throw new Error('Refusing migration: PostgreSQL did not confirm qr_print.');
-    console.log('PostgreSQL confirmed qr_print immediately before migration.');
-  } finally { await db.$disconnect(); }
+    const result = await db.$runCommandRaw({ ping: 1 });
+    if (Number(result.ok) !== 1) throw new Error('MongoDB did not confirm a successful ping.');
+    console.log('MongoDB confirmed qr_print immediately before schema synchronization.');
+  } finally {
+    await db.$disconnect();
+  }
 }
+
 const cli = path.join(root, 'node_modules', 'prisma', 'build', 'index.js');
-const result = spawnSync(process.execPath, [cli, ...forwarded], { cwd: workspace, env: process.env, stdio: 'inherit' });
+const result = spawnSync(process.execPath, [cli, ...args], { cwd: workspace, env: process.env, stdio: 'inherit' });
 process.exit(result.status ?? 1);

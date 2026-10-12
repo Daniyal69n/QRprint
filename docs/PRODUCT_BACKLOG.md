@@ -17,7 +17,7 @@ Priorities reflect launch risk. Existing routes and code are reused; no Elite PO
 
 ## P1 — Production infrastructure
 
-- Configure an HTTPS deployment and prove mobile-data access; choose managed PostgreSQL, private object storage, Redis/BullMQ only if workload needs it, and backup/restore procedures.
+- Configure an HTTPS deployment and prove mobile-data access; choose MongoDB Atlas (or another replica-set deployment), private object storage, Redis/BullMQ only if workload needs it, and backup/restore procedures.
 - Add real payment provider adapter and signed/idempotent webhooks only after provider credentials/account are available.
 - Add production storage retention/deletion, malware/content scanning policy, observability/alerts, and operational recovery runbooks.
 

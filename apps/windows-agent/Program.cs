@@ -8,11 +8,11 @@ namespace QRPrint.Agent;
 public record PrinterCapabilities(string Source, bool SupportsColor, bool CanDuplex, string[] PaperSizes, string[] Resolutions);
 public record PrinterInfo(string Name, bool InstalledQueue, bool Available, string Status, bool IsDefault, PrinterCapabilities? Capabilities = null);
 public record PrintResult(bool Accepted, string Status, string? QueueName, string? Detail);
-public interface IPrinterAdapter { Task<IReadOnlyList<PrinterInfo>> DiscoverAsync(); Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath); }
+public interface IPrinterAdapter { Task<IReadOnlyList<PrinterInfo>> DiscoverAsync(); Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false); }
 
 public sealed class SimulatedPrinterAdapter : IPrinterAdapter {
     public Task<IReadOnlyList<PrinterInfo>> DiscoverAsync() => Task.FromResult<IReadOnlyList<PrinterInfo>>([new("SIMULATED-ONLY", false, true, "SIMULATED", false)]);
-    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath) {
+    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false) {
         if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"PDF file does not exist");
         Console.WriteLine("SIMULATED: queued job; no printer accessed and no pages printed.");
         await Task.Delay(500);
@@ -54,19 +54,22 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         return Task.FromResult<IReadOnlyList<PrinterInfo>>(printers);
     }
 
-    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath) {
+    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false) {
         if (!OperatingSystem.IsWindows()) return new(false,"UNAVAILABLE",queueName,"Windows printer queues are available only on Windows.");
         var settings = new PrinterSettings { PrinterName = queueName };
         if (!settings.IsValid) return new(false,"UNAVAILABLE",queueName,"The selected printer queue is not installed or available.");
+        if (doubleSided && !settings.CanDuplex) return new(false,"FAILED",queueName,"The selected Windows driver does not report double-sided printing support.");
         var probe=ReadQueueStatus(queueName);
         if (!probe.Available) return new(false,"UNAVAILABLE",queueName,$"Windows spooler reports the queue unavailable ({probe.Status}).");
         if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"PDF file does not exist");
         var renderer = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
         if (string.IsNullOrWhiteSpace(renderer) || !File.Exists(renderer)) return new(false,"UNAVAILABLE",queueName,"Configure QRPRINT_PDF_PRINT_COMMAND to a trusted PDF renderer executable before submitting jobs.");
         // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
-        // command line must be provided via QRPRINT_PDF_PRINT_ARGS with {printer} and {file}.
-        var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" \"{file}\"";
-        var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath);
+        // command line must support QRPRINT_PDF_PRINT_ARGS placeholders {printer}, {file}, and {duplex}.
+        var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" \"{file}\"";
+        if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
+        var duplex = doubleSided ? "duplexlong" : "simplex";
+        var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
         using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
         if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
         await process.WaitForExitAsync();
@@ -161,7 +164,7 @@ public static class Program {
         try{
             var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id);
             PrintResult result;
-            try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy); }
+            try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy,entry.DoubleSided); }
             finally { await AgentLocalSpool.DeleteSubmissionCopyAsync(entry.ShopId,entry.Id,submissionCopy); }
             if(entry.Mode=="SIMULATED"&&result.Accepted)resultStatus="SIMULATED_COMPLETE";
             else if(entry.Mode=="REAL"&&result.Accepted)resultStatus="SPOOLER_ACCEPTED";
@@ -210,8 +213,10 @@ public static class Program {
                 var id=job.GetProperty("id").GetString()!;var token=job.GetProperty("leaseToken").GetString()!;
                 Console.WriteLine($"Claimed job {id} ({mode}); downloading fitted PDF.");
                 try {
+                    using var options=await api.GetJobPrintOptionsAsync(id,token);
+                    var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
                     var bytes=await api.DownloadAsync(id,token);
-                    var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
+                    var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
                     await SyncSpoolEntryAsync(api,adapter,local);
                 } catch(Exception ex){Console.Error.WriteLine($"Job {id} was not submitted; local download persistence or delivery failed: {ex.Message}");}
             }

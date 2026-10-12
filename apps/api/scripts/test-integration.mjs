@@ -18,11 +18,12 @@ async function findIntegrationTests(dir){
 }
 const files=await findIntegrationTests(path.join(workspace,'src'));
 if(files.length===0){console.log('No database integration tests are registered; nothing was run.');process.exit(0);}
-const value=process.env.TEST_DATABASE_URL;
-if(!value)throw new Error('Refusing integration tests: TEST_DATABASE_URL is not configured.');
+const value=process.env.TEST_MONGODB_URI;
+if(!value)throw new Error('Refusing integration tests: TEST_MONGODB_URI is not configured.');
 let url;
-try{url=new URL(value);}catch{throw new Error('Refusing integration tests: TEST_DATABASE_URL target could not be verified.');}
-if(!['postgres:','postgresql:'].includes(url.protocol)||decodeURIComponent(url.pathname.replace(/^\//,''))!=='qr_print_test')throw new Error(`Refusing integration tests: expected database qr_print_test, configured target is ${decodeURIComponent(url.pathname.replace(/^\//,''))||'unknown'}.`);
+try{url=new URL(value);}catch{throw new Error('Refusing integration tests: TEST_MONGODB_URI target could not be verified.');}
+const database=url.searchParams.get('dbName')||decodeURIComponent(url.pathname.replace(/^\//,''));
+if(!['mongodb:','mongodb+srv:'].includes(url.protocol)||database!=='qr_print_test')throw new Error(`Refusing integration tests: expected MongoDB database qr_print_test, configured database is ${database||'unknown'}.`);
 const cli=path.join(root,'node_modules','tsx','dist','cli.mjs');
-const result=spawnSync(process.execPath,[cli,'--test',...files],{cwd:workspace,env:{...process.env,DATABASE_URL:value,NODE_ENV:'test',PAYMENT_MODE:'mock',PRINT_EXECUTION_MODE:'simulated'},stdio:'inherit'});
+const result=spawnSync(process.execPath,[cli,'--test',...files],{cwd:workspace,env:{...process.env,MONGODB_URI:value,NODE_ENV:'test',PAYMENT_MODE:'mock',PRINT_EXECUTION_MODE:'simulated'},stdio:'inherit'});
 process.exit(result.status??1);

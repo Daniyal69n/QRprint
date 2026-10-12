@@ -23,12 +23,26 @@ public sealed class AgentApiClient : IDisposable {
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {payload}");
         return JsonDocument.Parse(payload);
     }
+    public async Task<JsonDocument> PutAsync(string route,object body,CancellationToken ct=default) {
+        using var response=await client.PutAsync(route,new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json"),ct);
+        var payload=await response.Content.ReadAsStringAsync(ct);
+        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {payload}");
+        return JsonDocument.Parse(payload);
+    }
     public async Task<JsonDocument> GetJobStateAsync(string jobId,string leaseToken,CancellationToken ct=default) {
         using var request=new HttpRequestMessage(HttpMethod.Get,$"agent/jobs/{Uri.EscapeDataString(jobId)}/state");
         request.Headers.Add("X-Job-Lease",leaseToken);
         using var response=await client.SendAsync(request,ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
         if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Job state request returned {(int)response.StatusCode}: {payload}");
+        return JsonDocument.Parse(payload);
+    }
+    public async Task<JsonDocument> GetJobPrintOptionsAsync(string jobId,string leaseToken,CancellationToken ct=default) {
+        using var request=new HttpRequestMessage(HttpMethod.Get,$"agent/jobs/{Uri.EscapeDataString(jobId)}/print-options");
+        request.Headers.Add("X-Job-Lease",leaseToken);
+        using var response=await client.SendAsync(request,ct);
+        var payload=await response.Content.ReadAsStringAsync(ct);
+        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Print options request returned {(int)response.StatusCode}: {payload}");
         return JsonDocument.Parse(payload);
     }
     public async Task<byte[]> DownloadAsync(string jobId,string leaseToken,CancellationToken ct=default) {

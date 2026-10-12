@@ -3,8 +3,8 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider = "mongodb"
+  url      = env("MONGODB_URI")
 }
 
 enum Role {
@@ -20,6 +20,7 @@ enum OrderStatus {
 }
 enum PaymentStatus {
   PENDING
+  SUBMITTED
   VERIFIED
   CASH_AUTHORIZED
   FAILED
@@ -54,10 +55,11 @@ enum DocumentStatus {
 }
 
 model User {
-  id           String       @id @default(cuid())
+  id           String       @id @default(cuid()) @map("_id")
   email        String       @unique
   passwordHash String
   role         Role         @default(CUSTOMER)
+  isActive     Boolean      @default(true)
   createdAt    DateTime     @default(now())
   shops        Shop[]
   orders       Order[]
@@ -68,11 +70,12 @@ model User {
 }
 
 model Shop {
-  id        String        @id @default(cuid())
+  id        String        @id @default(cuid()) @map("_id")
   ownerId   String
   name      String
   slug      String        @unique
   isActive  Boolean       @default(true)
+  supportsDuplex Boolean  @default(false)
   createdAt DateTime      @default(now())
   owner     User          @relation(fields: [ownerId], references: [id])
   printers  Printer[]
@@ -82,7 +85,7 @@ model Shop {
 }
 
 model Printer {
-  id             String     @id @default(cuid())
+  id             String     @id @default(cuid()) @map("_id")
   shopId         String
   name           String
   queueName      String?
@@ -96,7 +99,7 @@ model Printer {
 }
 
 model AgentDevice {
-  id            String   @id @default(cuid())
+  id            String   @id @default(cuid()) @map("_id")
   shopId        String
   userId        String   @unique
   name          String
@@ -113,7 +116,7 @@ model AgentDevice {
 }
 
 model Document {
-  id        String         @id @default(cuid())
+  id        String         @id @default(cuid()) @map("_id")
   ownerId   String
   storageKey String
   mimeType  String
@@ -126,7 +129,7 @@ model Document {
 }
 
 model Order {
-  id              String      @id @default(cuid())
+  id              String      @id @default(cuid()) @map("_id")
   customerId      String
   shopId          String
   documentId      String
@@ -134,7 +137,8 @@ model Order {
   copies          Int         @default(1)
   paperSize       String      @default("A4")
   color           Boolean     @default(false)
-  total           Decimal     @db.Decimal(10, 2)
+  doubleSided     Boolean     @default(false)
+  total           Float
   idempotencyKey  String      @unique
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
@@ -146,12 +150,12 @@ model Order {
 }
 
 model Pricing {
-  id             String   @id @default(cuid())
+  id             String   @id @default(cuid()) @map("_id")
   shopId         String
   paperSize      String
   color          Boolean  @default(false)
-  pricePerPage   Decimal  @db.Decimal(10, 2)
-  colorSurcharge Decimal  @default(0) @db.Decimal(10, 2)
+  pricePerPage   Float
+  colorSurcharge Float    @default(0)
   simpleDefaults Json?
   updatedAt      DateTime @updatedAt
   shop           Shop     @relation(fields: [shopId], references: [id])
@@ -159,11 +163,12 @@ model Pricing {
 }
 
 model Payment {
-  id         String   @id @default(cuid())
+  id         String   @id @default(cuid()) @map("_id")
   orderId    String   @unique
   provider   String
   providerRef String?
-  amount     Decimal  @db.Decimal(10, 2)
+  customerReference String?
+  amount     Float
   status     PaymentStatus @default(PENDING)
   createdAt  DateTime @default(now())
   verifiedAt DateTime?
@@ -171,7 +176,7 @@ model Payment {
 }
 
 model PrintJob {
-  id            String    @id @default(cuid())
+  id            String    @id @default(cuid()) @map("_id")
   orderId       String    @unique
   printerId     String?
   mode          PrintMode
@@ -198,7 +203,7 @@ model PrintJob {
 }
 
 model AgentEvent {
-  id            String      @id @default(cuid())
+  id            String      @id @default(cuid()) @map("_id")
   jobId         String
   agentDeviceId String
   actorId       String?
@@ -214,7 +219,7 @@ model AgentEvent {
 }
 
 model AuditLog {
-  id         String   @id @default(cuid())
+  id         String   @id @default(cuid()) @map("_id")
   actorId    String?
   action     String
   targetType String
@@ -225,7 +230,12 @@ model AuditLog {
 }
 
 model PlatformSetting {
-  id                    String   @id @default("platform")
+  id                    String   @id @default("platform") @map("_id")
   commissionBasisPoints Int      @default(0)
+  manualPaymentEnabled  Boolean  @default(false)
+  manualPaymentProvider String?
+  manualPaymentAccountName String?
+  manualPaymentAccountNumber String?
+  manualPaymentInstructions String?
   updatedAt             DateTime @updatedAt
 }

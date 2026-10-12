@@ -1,10 +1,10 @@
 export function databaseNameFromUrl(value:string|undefined):string {
-  if(!value)throw new Error('DATABASE_URL is required. Configure the isolated QR Print database URL.');
+  if(!value)throw new Error('MONGODB_URI is required. Configure the isolated QR Print MongoDB URL.');
   let parsed:URL;
   try{parsed=new URL(value);}catch{throw new Error('Database URL is malformed; target could not be verified.');}
-  if(!['postgres:','postgresql:'].includes(parsed.protocol))throw new Error('Database URL must use PostgreSQL.');
-  const name=decodeURIComponent(parsed.pathname.replace(/^\//,''));
-  if(!name)throw new Error('Database name is missing from DATABASE_URL.');
+  if(!['mongodb:','mongodb+srv:'].includes(parsed.protocol))throw new Error('Database URL must use MongoDB.');
+  const name=parsed.searchParams.get('dbName')||decodeURIComponent(parsed.pathname.replace(/^\//,''));
+  if(!name)throw new Error('Database name is missing from the MongoDB URL. Set a database path or dbName query parameter.');
   return name;
 }
 
