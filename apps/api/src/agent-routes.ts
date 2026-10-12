@@ -3,7 +3,7 @@ import type {PrismaClient,PrintJobStatus,PhysicalPrintStatus,Prisma} from '@pris
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
-import {hashSecret,canTransitionJob,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
+import {hashSecret,canTransitionJob,canQueuePayment,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
 import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl} from './private-storage.js';
 
@@ -30,8 +30,40 @@ export function createAgentRouter(db:PrismaClient){
    db.agentDevice.update({where:{id:agent.id},data:{lastSeenAt:now}}),
    db.printJob.updateMany({where:{claimedById:agent.id,status:{in:['LEASED','DOWNLOADED','SUBMITTING']}},data:{leaseExpiresAt:expires}}),
  ]);if(b.observedQueue){if(b.observedQueue.name!==((await db.printer.findUnique({where:{id:agent.printerId},select:{queueName:true}}))?.queueName??''))return fail(res,400,'QUEUE_BINDING_MISMATCH','Observed queue does not match this agent printer binding.');await db.printer.update({where:{id:agent.printerId},data:{status:b.observedQueue.available&&b.observedQueue.installedQueue?`AVAILABLE:${b.observedQueue.status}`:`UNAVAILABLE:${b.observedQueue.status}`,...(b.observedQueue.capabilities?{capabilities:b.observedQueue.capabilities as Prisma.InputJsonValue}:{})}});}const printer=await db.printer.findUnique({where:{id:agent.printerId}});res.json({ok:true,serverTime:now.toISOString(),leaseSeconds,device:{id:device.id,name:device.name,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode},printer:printer&&{id:printer.id,name:printer.name,queueName:printer.queueName,status:printer.status,capabilities:printer.capabilities}});}catch(e){next(e);}});
- router.post('/jobs/claim',async(req:AgentRequest,res,next)=>{try{await reapExpired(db);const agent=req.agent!,now=new Date(),expires=new Date(now.getTime()+leaseSeconds*1000);let token='';
-  const claimed=await atomicClaimNext({candidate:async()=>{const j=await db.printJob.findFirst({where:{printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],order:{payment:{is:{status:{in:['VERIFIED','CASH_AUTHORIZED','CUSTOMER_ATTESTED']}}}}},orderBy:{createdAt:'asc'},select:{id:true}});return j??undefined;},claimIfQueued:async(j:{id:string})=>{token=`qpl_${randomUUID()}`;const updated=await db.printJob.updateMany({where:{id:j.id,printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},order:{payment:{is:{status:{in:['VERIFIED','CASH_AUTHORIZED','CUSTOMER_ATTESTED']}}}}},data:{status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null}});return updated.count?j:undefined;}});
+ router.post('/jobs/claim',async(req:AgentRequest,res,next)=>{try{
+  await reapExpired(db);
+  const agent=req.agent!,now=new Date(),expires=new Date(now.getTime()+leaseSeconds*1000);
+  let token='';
+  const skipped=new Set<string>();
+  const claimed=await atomicClaimNext({
+   candidate:async()=>{
+    while(true){
+     const candidates=await db.printJob.findMany({
+      where:{printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],...(skipped.size?{id:{notIn:[...skipped]}}:{})},
+      orderBy:{createdAt:'asc'},
+      take:25,
+      select:{id:true,orderId:true},
+     });
+     for(const candidate of candidates){
+      const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
+      if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);continue;}
+      return candidate;
+     }
+     if(candidates.length<25)return undefined;
+    }
+   },
+   claimIfQueued:async(candidate:{id:string;orderId:string})=>{
+    const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
+    if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);return undefined;}
+    token=`qpl_${randomUUID()}`;
+    const updated=await db.printJob.updateMany({
+     where:{id:candidate.id,printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}]},
+     data:{status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
+    });
+    if(!updated.count)skipped.add(candidate.id);
+    return updated.count?candidate:undefined;
+   },
+  });
   if(!claimed)return res.json({job:null,leaseSeconds});const job=await db.printJob.findUniqueOrThrow({where:{id:claimed.id},include:{order:{include:{document:true,payment:true}}}});log('info','agent.job.claimed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,attempt:job.attempt});res.json({job:{id:job.id,idempotencyKey:job.idempotencyKey,mode:job.mode,status:job.status,attempt:job.attempt,leaseToken:token,leaseExpiresAt:expires.toISOString(),order:{id:job.order.id,paperSize:job.order.paperSize,copies:job.order.copies,color:job.order.color,pageCount:job.order.document.pageCount,paymentStatus:job.order.payment?.status}},leaseSeconds});
  }catch(e){next(e);}});
  router.get('/jobs/:id/state',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,id=routeParam(req,"id");await reapExpired(db);const job=await db.printJob.findUnique({where:{id},select:{id:true,printerId:true,mode:true,status:true,physicalStatus:true,claimedById:true,leaseTokenHash:true,leaseExpiresAt:true,order:{select:{shopId:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');const supplied=String(req.headers['x-job-lease']||'');res.json({id:job.id,status:job.status,physicalStatus:job.physicalStatus,leaseExpiresAt:job.leaseExpiresAt?.toISOString()??null,leaseOwned:!!supplied&&leaseValid(job,agent.id,supplied),claimedByThisAgent:job.claimedById===agent.id});}catch(e){next(e);}});

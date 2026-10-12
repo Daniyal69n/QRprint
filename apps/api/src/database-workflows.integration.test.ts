@@ -404,6 +404,8 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     assert.equal(claimedOrder.printJob?.status,'QUEUED');
     assert.equal(claimedOrder.printJob?.printerId,printer.id);
     if(claimedOrder.printJob)jobIds.push(claimedOrder.printJob.id);
+    const claimedCheckoutJob=await claimOne();
+    assert.equal(claimedCheckoutJob.id,claimedOrder.printJob?.id,'agent claims the auto-queued customer-attested order');
     const claimedPayment=await db.payment.findUniqueOrThrow({where:{orderId:claimedOrder.id}});
     paymentIds.push(claimedPayment.id);
     assert.equal(claimedPayment.status,'CUSTOMER_ATTESTED','checkout records that the customer claims to have sent payment; no owner verification is required');
@@ -412,7 +414,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     assert.equal(ownerOrderList.status,200);
     const claimedForOwner=(await ownerOrderList.json() as Array<{id:string;payment:{status:string}|null;printJob:{id:string;status:string}|null}>).find(item=>item.id===claimedOrder.id);
     assert.equal(claimedForOwner?.payment?.status,'CUSTOMER_ATTESTED');
-    assert.equal(claimedForOwner?.printJob?.status,'QUEUED','owner panel shows the already queued job without a verification action');
+    assert.equal(claimedForOwner?.printJob?.status,'LEASED','owner panel shows the agent has claimed the job without a verification action');
     const manualOrderResponse=await call('/orders',json({shopId:shop.id,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-manual-order`}));
     assert.equal(manualOrderResponse.status,201);
     const manualOrder=await manualOrderResponse.json() as {id:string};
