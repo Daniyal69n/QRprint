@@ -65,7 +65,11 @@ export default function Upload(){
 
   async function loadPreview(id:string,paperSize:PaperSize,authToken=token){
     const response=await fetch(apiUrl(`/documents/${id}/preview?paperSize=${paperSize}&orientation=AUTO`),{headers:{Authorization:`Bearer ${authToken}`}});
-    if(!response.ok)throw new Error('Could not render the fitted PDF preview.');
+    if(!response.ok){
+      let message='Could not render the fitted PDF preview.';
+      try{const data=await response.json();message=data.error?.message||data.error||message;}catch{}
+      throw new Error(message);
+    }
     const blob=await response.blob();
     setPreviewUrl(old=>{if(old)URL.revokeObjectURL(old);return URL.createObjectURL(blob);});
   }

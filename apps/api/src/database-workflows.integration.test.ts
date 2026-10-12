@@ -196,7 +196,24 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     assert.equal((await prefixedHealth.json() as {database:string}).database,'ready');
     const protectedUpload=await call('/api/documents/upload-url',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
     assert.equal(protectedUpload.status,401,'Vercel upload URL requires customer authentication before storage access');
+    const prefixedPreview=await call(`/api/documents/${document.id}/preview?paperSize=A4&orientation=AUTO`,{headers:{authorization:customerAuth}});
+    assert.equal(prefixedPreview.status,200,'Vercel /api prefix reaches the authenticated preview route');
+    assert.match(prefixedPreview.headers.get('content-type')??'',/application\/pdf/);
+    const prefixedOrder=await call('/api/orders',json({shopId:shop.id,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-prefixed`}));
+    assert.equal(prefixedOrder.status,201,'Vercel /api prefix reaches order creation and resolves the supplied shop/document');
+    const prefixedOrderData=await prefixedOrder.json() as {id:string};
+    orderIds.push(prefixedOrderData.id);
+    auditTargetIds.push(prefixedOrderData.id);
   } finally { if(priorVercel===undefined)delete process.env.VERCEL;else process.env.VERCEL=priorVercel; }
+  const missingPreview=await call(`/documents/${randomUUID()}/preview?paperSize=A4`,{headers:{authorization:customerAuth}});
+  assert.equal(missingPreview.status,404);
+  assert.equal((await missingPreview.json() as {error:{code:string}}).error.code,'DOCUMENT_NOT_FOUND');
+  const missingShopOrder=await call('/orders',json({shopId:`${tag}-unknown-shop`,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-missing-shop`}));
+  assert.equal(missingShopOrder.status,404);
+  assert.equal((await missingShopOrder.json() as {error:{code:string}}).error.code,'SHOP_NOT_FOUND');
+  const missingDocumentOrder=await call('/orders',json({shopId:shop.id,documentId:randomUUID(),copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-missing-doc`}));
+  assert.equal(missingDocumentOrder.status,404);
+  assert.equal((await missingDocumentOrder.json() as {error:{code:string}}).error.code,'DOCUMENT_NOT_FOUND');
   const qr = await call(`/shops/${shop.slug}/qr.svg`);
   assert.equal(qr.status, 200);
   assert.match(qr.headers.get('content-type')||'',/image\/svg\+xml/);
