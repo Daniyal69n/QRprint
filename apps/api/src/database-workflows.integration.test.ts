@@ -48,7 +48,14 @@ test('public shop-owner registration atomically creates a fixed-role owner and s
   const body={ownerName:'Self-service Owner',email,password:'integration-test-password',shopName:'Self-service Print Shop',slug};
   const roleOverride=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,role:'SUPER_ADMIN'})});
   assert.equal(roleOverride.status,400);
+  const roleError=await roleOverride.json() as {error:{details:Array<{field:string;message:string}>}};
+  assert.ok(roleError.error.details.some(issue=>issue.message?.includes('Unrecognized key')));
   assert.equal(await db.user.findUnique({where:{email},select:{id:true}}),null);
+
+  const invalidSlug=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,slug:'Elite'})});
+  assert.equal(invalidSlug.status,400);
+  const slugError=await invalidSlug.json() as {error:{details:Array<{field:string;message:string}>}};
+  assert.ok(slugError.error.details.some(issue=>issue.field==='slug'));
 
   const response=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   assert.equal(response.status,201);

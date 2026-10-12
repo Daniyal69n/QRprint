@@ -34,9 +34,9 @@ public sealed class OnboardingWizardForm : Form {
     private bool signedIn;
 
     public OnboardingWizardForm() {
-        Text="QR Print | Shop setup";StartPosition=FormStartPosition.CenterScreen;MinimumSize=new Size(780,720);Size=new Size(860,790);BackColor=Color.FromArgb(244,247,250);Font=new Font("Segoe UI",10);Icon=null;
-        var root=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(28),ColumnCount=1,RowCount=4};
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));root.RowStyles.Add(new RowStyle(SizeType.AutoSize));root.RowStyles.Add(new RowStyle(SizeType.Percent,100));root.RowStyles.Add(new RowStyle(SizeType.AutoSize));Controls.Add(root);
+        Text="QR Print | Shop setup";StartPosition=FormStartPosition.CenterScreen;MinimumSize=new Size(720,560);Size=new Size(820,680);BackColor=Color.FromArgb(244,247,250);Font=new Font("Segoe UI",10);Icon=null;
+        var root=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(20),ColumnCount=1,RowCount=3};
+        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));root.RowStyles.Add(new RowStyle(SizeType.AutoSize));root.RowStyles.Add(new RowStyle(SizeType.Percent,100));Controls.Add(root);
         root.Controls.Add(new Label{Text="Set up your print shop",AutoSize=true,Font=new Font("Segoe UI Semibold",22,FontStyle.Bold),ForeColor=Color.FromArgb(16,34,53),Margin=new Padding(0,0,0,4)},0,0);
         root.Controls.Add(new Label{Text="Create or sign in to a shop-owner account, connect a Windows printer if available, and generate your shop's public QR code. Agent credentials are protected with Windows DPAPI.",AutoSize=true,MaximumSize=new Size(760,0),ForeColor=Color.FromArgb(72,91,105),Margin=new Padding(0,0,0,20)},0,1);
         var card=new TableLayoutPanel{Dock=DockStyle.Fill,Padding=new Padding(22),BackColor=Color.White,ColumnCount=2,AutoScroll=true};
@@ -48,12 +48,13 @@ public sealed class OnboardingWizardForm : Form {
         AddRow(card,"Owner name",ownerName);AddRow(card,"Email",email);AddRow(card,"Password",password);
         AddRow(card,"",connect);
         AddSection(card,"3. Shop and printer");
+        AddRow(card,"Shop URL slug tip",new Label{Text="Use lowercase letters, numbers, and hyphens. For example, “Elite” becomes “elite”.",AutoSize=true,MaximumSize=new Size(560,0),ForeColor=Color.FromArgb(72,91,105)});
         AddRow(card,"Shop",shops);AddRow(card,"New shop name",shopName);AddRow(card,"New shop URL slug",shopSlug);
         AddRow(card,"Installed printer queue",queues);AddRow(card,"Driver-reported details",capabilities);AddRow(card,"",duplex);AddRow(card,"",rescan);AddRow(card,"",startOnLogin);
         var footer=new FlowLayoutPanel{Dock=DockStyle.Fill,AutoSize=true,FlowDirection=FlowDirection.TopDown,WrapContents=false,Padding=new Padding(0,16,0,0)};
         footer.Controls.Add(status);footer.Controls.Add(setup);footer.Controls.Add(success);footer.Controls.Add(qrPreview);
         var qrActions=new FlowLayoutPanel{AutoSize=true,FlowDirection=FlowDirection.LeftToRight,WrapContents=false};qrActions.Controls.Add(downloadQr);footer.Controls.Add(qrActions);
-        root.Controls.Add(footer,0,3);
+        var footerRow=card.RowCount++;card.RowStyles.Add(new RowStyle(SizeType.AutoSize));card.Controls.Add(footer,0,footerRow);card.SetColumnSpan(footer,2);
 
         shops.Items.Add(new ShopOption(null,null,"","Create a new shop"));shops.SelectedIndex=0;
         shops.SelectedIndexChanged+=(_,_)=>{SetShopFields();UpdateSetupEnabled();};
@@ -61,6 +62,7 @@ public sealed class OnboardingWizardForm : Form {
         shopName.TextChanged+=(_,_)=>UpdateSetupEnabled();shopSlug.TextChanged+=(_,_)=>UpdateSetupEnabled();
         createAccount.CheckedChanged+=(_,_)=>UpdateAccountFields();
         existingAccount.CheckedChanged+=(_,_)=>UpdateAccountFields();
+        shopSlug.Leave+=(_,_)=>NormalizeShopSlug();
         connect.Click+=async(_,_)=>await ConnectOwnerAsync();
         rescan.Click+=async(_,_)=>await DiscoverQueuesAsync();
         setup.Click+=async(_,_)=>await CompleteSetupAsync();
@@ -120,6 +122,7 @@ public sealed class OnboardingWizardForm : Form {
     private async Task ConnectOwnerAsync() {
         connect.Enabled=false;status.Text="Connecting securely…";
         try {
+            if(createAccount.Checked)NormalizeShopSlug();
             var baseUrl=apiUrl.Text.Trim();
             if(!Uri.TryCreate(baseUrl,UriKind.Absolute,out var uri)||!SafeUrl(uri))throw new InvalidOperationException("Enter a public HTTPS API address, including /api (HTTP is allowed only for localhost development).");
             ownerApi?.Dispose();ownerApi=new AgentApiClient(baseUrl);
@@ -260,6 +263,13 @@ public sealed class OnboardingWizardForm : Form {
         if(dialog.ShowDialog(this)!=DialogResult.OK)return;
         try { qrPreview.Image.Save(dialog.FileName,System.Drawing.Imaging.ImageFormat.Png);status.Text=$"QR code saved to {dialog.FileName}."; }
         catch(Exception ex) { status.Text=$"Could not save the QR image: {ex.Message}"; }
+    }
+
+    private void NormalizeShopSlug() {
+        var normalized=Regex.Replace(shopSlug.Text.Trim().ToLowerInvariant(),"[^a-z0-9]+","-").Trim('-');
+        if(shopSlug.Text==normalized)return;
+        shopSlug.Text=normalized;
+        shopSlug.SelectionStart=shopSlug.TextLength;
     }
 
     private bool HasStartupEntry() {

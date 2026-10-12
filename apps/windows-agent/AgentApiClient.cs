@@ -14,19 +14,19 @@ public sealed class AgentApiClient : IDisposable {
     public async Task<JsonDocument> GetAsync(string route,CancellationToken ct=default) {
         using var response=await client.GetAsync(route,ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {payload}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<JsonDocument> PostAsync(string route,object body,CancellationToken ct=default) {
         using var response=await client.PostAsync(route,new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json"),ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {payload}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<JsonDocument> PutAsync(string route,object body,CancellationToken ct=default) {
         using var response=await client.PutAsync(route,new StringContent(JsonSerializer.Serialize(body),Encoding.UTF8,"application/json"),ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {payload}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<JsonDocument> GetJobStateAsync(string jobId,string leaseToken,CancellationToken ct=default) {
@@ -34,7 +34,7 @@ public sealed class AgentApiClient : IDisposable {
         request.Headers.Add("X-Job-Lease",leaseToken);
         using var response=await client.SendAsync(request,ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Job state request returned {(int)response.StatusCode}: {payload}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException("agent job state",response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<JsonDocument> GetJobPrintOptionsAsync(string jobId,string leaseToken,CancellationToken ct=default) {
@@ -42,14 +42,14 @@ public sealed class AgentApiClient : IDisposable {
         request.Headers.Add("X-Job-Lease",leaseToken);
         using var response=await client.SendAsync(request,ct);
         var payload=await response.Content.ReadAsStringAsync(ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Print options request returned {(int)response.StatusCode}: {payload}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException("agent print options",response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
     public async Task<byte[]> DownloadAsync(string jobId,string leaseToken,CancellationToken ct=default) {
         using var request=new HttpRequestMessage(HttpMethod.Get,$"agent/jobs/{Uri.EscapeDataString(jobId)}/document");
         request.Headers.Add("X-Job-Lease",leaseToken);
         using var response=await client.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"Document download returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException("agent document download",response.StatusCode,await response.Content.ReadAsStringAsync(ct));
         if(response.Content.Headers.ContentType?.MediaType?.Equals("application/json",StringComparison.OrdinalIgnoreCase)==true){
             using var payload=JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
             var uri=new Uri(payload.RootElement.GetProperty("downloadUrl").GetString()??throw new InvalidOperationException("API did not return a document URL."));
@@ -64,8 +64,32 @@ public sealed class AgentApiClient : IDisposable {
     }
     public async Task<byte[]> GetBytesAsync(string route,CancellationToken ct=default) {
         using var response=await client.GetAsync(route,HttpCompletionOption.ResponseHeadersRead,ct);
-        if(!response.IsSuccessStatusCode)throw new HttpRequestException($"API {route} returned {(int)response.StatusCode}: {await response.Content.ReadAsStringAsync(ct)}");
+        if(!response.IsSuccessStatusCode)throw CreateApiException(route,response.StatusCode,await response.Content.ReadAsStringAsync(ct));
         return await response.Content.ReadAsByteArrayAsync(ct);
+    }
+    private static HttpRequestException CreateApiException(string route,System.Net.HttpStatusCode status,string payload) {
+        var message="Request failed.";
+        try {
+            using var document=JsonDocument.Parse(payload);
+            if(document.RootElement.ValueKind==JsonValueKind.Object&&document.RootElement.TryGetProperty("error",out var error)) {
+                if(error.ValueKind==JsonValueKind.Object) {
+                    if(error.TryGetProperty("message",out var text)&&text.ValueKind==JsonValueKind.String)message=text.GetString()??message;
+                    if(error.TryGetProperty("details",out var details)&&details.ValueKind==JsonValueKind.Array) {
+                        var issues=details.EnumerateArray().Select(issue=>{
+                            var field=issue.TryGetProperty("field",out var fieldValue)?fieldValue.GetString():null;
+                            var reason=issue.TryGetProperty("message",out var reasonValue)?reasonValue.GetString():null;
+                            return string.IsNullOrWhiteSpace(field)?reason:$"{field}: {reason}";
+                        }).Where(issue=>!string.IsNullOrWhiteSpace(issue));
+                        var summary=string.Join("; ",issues);
+                        if(summary.Length>500)summary=summary[..500];
+                        if(summary.Length>0)message=$"{message} {summary}";
+                    }
+                } else if(error.ValueKind==JsonValueKind.String)message=error.GetString()??message;
+            }
+        } catch(JsonException) {
+            message="The API returned an unreadable error response.";
+        }
+        return new HttpRequestException($"API {route} returned {(int)status}: {message}");
     }
     public void Dispose()=>client.Dispose();
 }
