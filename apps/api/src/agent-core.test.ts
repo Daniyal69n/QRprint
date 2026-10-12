@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import type {PrismaClient} from '@prisma/client';
 import type {Response} from 'express';
-import {atomicClaimNext,canAgentUseShop,canQueuePayment,claimSkipReason,expiredLeaseAction,isAgentCredential,mintAgentSecret,resolveAgentEvent,type AgentJobState} from './agent-core.js';
+import {atomicClaimNext,canAdoptQueuedJob,canAgentUseShop,canQueuePayment,claimCasWhere,claimSkipReason,expiredLeaseAction,isAgentCredential,mintAgentSecret,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
 
 test('agent credential format rejects missing or malformed secrets',()=>{const key=mintAgentSecret();assert.equal(isAgentCredential(key),true);assert.equal(isAgentCredential('agent-password'),false);});
@@ -15,3 +15,24 @@ test('agent status event key retries replay and conflicting duplicates reject',(
 test('a submit interruption cannot be classified as an automatic retry',()=>{assert.equal(expiredLeaseAction('SUBMITTING'),'UNKNOWN');});
 test('verified, counter-authorized, or customer-attested payments may queue without changing attestation into verification',()=>{assert.equal(canQueuePayment('VERIFIED'),true);assert.equal(canQueuePayment('CASH_AUTHORIZED'),true);assert.equal(canQueuePayment('CUSTOMER_ATTESTED'),true);assert.equal(canQueuePayment('PENDING'),false);assert.equal(canQueuePayment('SUBMITTED'),false);assert.equal(canQueuePayment(null),false);});
 test('claim eligibility diagnoses printer, mode, retry-limit, and backoff mismatches',()=>{const agent={printerId:'printer-a',mode:'REAL'},base={printerId:'printer-a',mode:'REAL',attempt:0,maxAttempts:3,nextAttemptAt:null};assert.equal(claimSkipReason({...base,printerId:'printer-b'},agent,new Date(),3),'PRINTER_MISMATCH');assert.equal(claimSkipReason({...base,printerId:null},agent,new Date(),3),null,'unassigned print jobs can be adopted by the enrolled shop agent');assert.equal(claimSkipReason({...base,printerId:'printer-b'},agent,new Date(),3,true),null,'a shop can reassign a job from an unused printer');assert.equal(claimSkipReason({...base,mode:'SIMULATED'},agent,new Date(),3),'MODE_MISMATCH');assert.equal(claimSkipReason({...base,attempt:3},agent,new Date(),3),'ATTEMPT_LIMIT');assert.equal(claimSkipReason({...base,nextAttemptAt:new Date(Date.now()+60_000)},agent,new Date(),3),'RETRY_SCHEDULED');assert.equal(claimSkipReason(base,agent,new Date(),3),null);});
+test('queued jobs for another live printer become adoptable after they sit unclaimed',()=>{
+  const agent={printerId:'printer-b',shopId:'shop-a'};
+  const connected=new Set(['printer-a','printer-b']);
+  const now=new Date();
+  const base={printerId:'printer-a',printerShopId:'shop-a',createdAt:now};
+  assert.equal(canAdoptQueuedJob({printerId:null,createdAt:now,printerShopId:'shop-a'},agent,connected,now),true);
+  assert.equal(canAdoptQueuedJob({...base,printerId:'printer-b'},agent,connected,now),true);
+  assert.equal(canAdoptQueuedJob(base,agent,connected,now),false,'a fresh job stays with its live printer');
+  assert.equal(canAdoptQueuedJob({...base,createdAt:new Date(now.getTime()-21_000)},agent,connected,now),true,'a stale queued job can move to the shop agent that is actually polling');
+  assert.equal(canAdoptQueuedJob({...base,printerShopId:'shop-b',createdAt:new Date(now.getTime()-21_000)},agent,connected,now),false);
+  assert.equal(canAdoptQueuedJob(base,agent,new Set(['printer-b']),now),true);
+});
+test('claim compare-and-set filter avoids MongoDB null-OR, printerId, and relation predicates',()=>{
+  const where=claimCasWhere({id:'job-1',mode:'REAL'});
+  assert.deepEqual(where,{id:'job-1',mode:'REAL',status:'QUEUED'});
+  assert.equal('OR' in where,false);
+  assert.equal('order' in where,false);
+  assert.equal('printerId' in where,false);
+  assert.equal('attempt' in where,false);
+  assert.equal('nextAttemptAt' in where,false);
+});

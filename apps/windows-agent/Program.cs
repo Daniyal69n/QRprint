@@ -63,24 +63,59 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         var probe=ReadQueueStatus(queueName);
         if (!probe.Available) return new(false,"UNAVAILABLE",queueName,$"Windows spooler reports the queue unavailable ({probe.Status}).");
         if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"PDF file does not exist");
-        var renderer = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
-        if (string.IsNullOrWhiteSpace(renderer) || !File.Exists(renderer)) return new(false,"UNAVAILABLE",queueName,"Configure QRPRINT_PDF_PRINT_COMMAND to a trusted PDF renderer executable before submitting jobs.");
-        // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
-        // command line must support QRPRINT_PDF_PRINT_ARGS placeholders {printer}, {file}, and {duplex}.
-        var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" \"{file}\"";
-        if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
-        var duplex = doubleSided ? "duplexlong" : "simplex";
-        var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
-        using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
-        if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
+        var renderer = ResolvePdfRenderer();
+        if (!string.IsNullOrWhiteSpace(renderer)) {
+            // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
+            // command line must support QRPRINT_PDF_PRINT_ARGS placeholders {printer}, {file}, and {duplex}.
+            var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" \"{file}\"";
+            if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
+            var duplex = doubleSided ? "duplexlong" : "simplex";
+            var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
+            using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
+            if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
+            using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
+            try { await process.WaitForExitAsync(timeout.Token); }
+            catch(OperationCanceledException) {
+                try { process.Kill(entireProcessTree:true); } catch {}
+                return new(false,"OUTCOME_UNKNOWN",queueName,"PDF renderer did not finish within two minutes; submission outcome is unknown.");
+            }
+            if (process.ExitCode != 0) return new(false,"FAILED",queueName,$"PDF renderer exited with code {process.ExitCode}.");
+            return new(true,"SPOOLER_ACCEPTED",queueName,"The configured renderer returned success and the queue was not marked unavailable. This does not confirm paper output.");
+        }
+        return await SubmitViaPrintToAsync(queueName, pdfPath, doubleSided);
+    }
+
+    internal static string? ResolvePdfRenderer() {
+        var configured = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
+        if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured)) return configured;
+        string[] known = [
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SumatraPDF", "SumatraPDF.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "SumatraPDF", "SumatraPDF.exe"),
+        ];
+        return Array.Find(known, File.Exists);
+    }
+
+    private static async Task<PrintResult> SubmitViaPrintToAsync(string queueName, string pdfPath, bool doubleSided) {
+        if (doubleSided) return new(false,"FAILED",queueName,"Double-sided printing needs a PDF renderer (install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND). Windows PrintTo cannot set duplex.");
+        var info = new ProcessStartInfo {
+            FileName = pdfPath,
+            Verb = "PrintTo",
+            Arguments = $"\"{queueName}\"",
+            UseShellExecute = true,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            ErrorDialog = false,
+        };
+        if (!info.Verbs.Any(verb => verb.Equals("printto", StringComparison.OrdinalIgnoreCase)))
+            return new(false,"UNAVAILABLE",queueName,"This PC has no PrintTo handler for PDF files. Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND.");
+        using var process = Process.Start(info);
+        if (process is null) return new(true,"SPOOLER_ACCEPTED",queueName,"Windows handed the PDF to the PrintTo handler. Physical output remains unconfirmed.");
         using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
         try { await process.WaitForExitAsync(timeout.Token); }
         catch(OperationCanceledException) {
-            try { process.Kill(entireProcessTree:true); } catch {}
-            return new(false,"OUTCOME_UNKNOWN",queueName,"PDF renderer did not finish within two minutes; submission outcome is unknown.");
+            return new(true,"SPOOLER_ACCEPTED",queueName,"Windows PrintTo was started. The handler is still running; physical output remains unconfirmed.");
         }
-        if (process.ExitCode != 0) return new(false,"FAILED",queueName,$"PDF renderer exited with code {process.ExitCode}.");
-        return new(true,"SPOOLER_ACCEPTED",queueName,"The configured renderer returned success and the queue was not marked unavailable. This does not confirm paper output.");
+        return new(true,"SPOOLER_ACCEPTED",queueName,"Windows PrintTo completed. Physical output remains unconfirmed.");
     }
 }
 
@@ -160,8 +195,9 @@ public static class Program {
         Console.WriteLine($"Preparing job {entry.Id} for exact printer queue '{entry.QueueName}'.");
         var available=(await adapter.DiscoverAsync()).Any(p=>p.Name.Equals(entry.QueueName,StringComparison.Ordinal)&&p.Available);
         if(entry.Mode=="REAL"&&!available){Console.Error.WriteLine($"Job {entry.Id} was not submitted: exact assigned queue '{entry.QueueName}' is missing or unavailable.");entry=await SetPendingResultAsync(entry,"FAILED","Assigned Windows queue is unavailable before submission; no print was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report queue-unavailable status for job {entry.Id}: {ex.Message}");}return;}
-        var renderer=Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
-        if(entry.Mode=="REAL"&&(string.IsNullOrWhiteSpace(renderer)||!File.Exists(renderer))){Console.Error.WriteLine($"Job {entry.Id} was not submitted: configure QRPRINT_PDF_PRINT_COMMAND to a trusted PDF renderer.");entry=await SetPendingResultAsync(entry,"FAILED","Trusted PDF renderer is not configured; no submission was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report renderer configuration failure for job {entry.Id}: {ex.Message}");}return;}
+        var renderer=WindowsQueueAdapter.ResolvePdfRenderer();
+        var printTo=new ProcessStartInfo{FileName="job.pdf",UseShellExecute=true}.Verbs.Any(verb=>verb.Equals("printto",StringComparison.OrdinalIgnoreCase));
+        if(entry.Mode=="REAL"&&string.IsNullOrWhiteSpace(renderer)&&(entry.DoubleSided||!printTo)){var detail=entry.DoubleSided?"Double-sided printing needs SumatraPDF or QRPRINT_PDF_PRINT_COMMAND.":"Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND; this PC has no PDF PrintTo handler.";Console.Error.WriteLine($"Job {entry.Id} was not submitted: {detail}");entry=await SetPendingResultAsync(entry,"FAILED",detail);try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report renderer configuration failure for job {entry.Id}: {ex.Message}");}return;}
         if(entry.Stage=="DOWNLOADED")entry=entry with{Stage="SUBMISSION_INTENT"};
         await AgentLocalSpool.SaveAsync(entry);
         try{await ReportAsync(api,entry.Id,entry.LeaseToken,"SUBMITTING",entry.SubmissionEventKey);}

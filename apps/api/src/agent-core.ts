@@ -18,6 +18,18 @@ export function claimSkipReason(job:{printerId:string|null;mode:string;attempt:n
   if(job.nextAttemptAt&&job.nextAttemptAt>now)return 'RETRY_SCHEDULED';
   return null;
 }
+export const QUEUED_JOB_STALE_MS=20_000;
+export function canAdoptQueuedJob(job:{printerId:string|null;createdAt:Date;printerShopId:string|undefined},agent:{printerId:string;shopId:string},connectedPrinterIds:ReadonlySet<string>,now:Date,staleMs=QUEUED_JOB_STALE_MS):boolean{
+  if(job.printerId===null||job.printerId===agent.printerId)return true;
+  if(job.printerShopId!==undefined&&job.printerShopId!==agent.shopId)return false;
+  if(!connectedPrinterIds.has(job.printerId))return true;
+  return now.getTime()-job.createdAt.getTime()>=staleMs;
+}
+export function claimCasWhere(job:{id:string;mode:'SIMULATED'|'REAL'|string}){
+  // Prisma MongoDB updateMany cannot apply relation filters or null-OR predicates, so the
+  // compare-and-set only uses scalar fields. Eligibility is already checked on the candidate.
+  return {id:job.id,mode:job.mode as 'SIMULATED'|'REAL',status:'QUEUED' as const};
+}
 export function resolveAgentEvent(prior:{agentDeviceId:string;eventType:string}|null,agentDeviceId:string,eventType:string):'NEW'|'REPLAY'|'CONFLICT'{if(!prior)return 'NEW';return prior.agentDeviceId===agentDeviceId&&prior.eventType===eventType?'REPLAY':'CONFLICT';}
 
 export interface ClaimRepository<T>{candidate():Promise<T|undefined>;claimIfQueued(candidate:T):Promise<T|undefined>}

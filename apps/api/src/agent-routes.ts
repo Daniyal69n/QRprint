@@ -3,7 +3,7 @@ import type {PrismaClient,PrintJobStatus,PhysicalPrintStatus,Prisma} from '@pris
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
-import {hashSecret,canTransitionJob,canQueuePayment,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
+import {hashSecret,canTransitionJob,canQueuePayment,canAdoptQueuedJob,claimCasWhere,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
 import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl} from './private-storage.js';
 
@@ -15,12 +15,22 @@ function fail(res:Response,status:number,code:string,message:string){return res.
 async function reapExpired(db:PrismaClient){
   const now=new Date();
   const safeToRequeue=(['LEASED','DOWNLOADED'] as AgentJobState[]).filter(s=>expiredLeaseAction(s)==='REQUEUE');
-  const requeued=await db.printJob.updateMany({where:{status:{in:safeToRequeue},leaseExpiresAt:{lte:now}},data:{status:'QUEUED',claimedById:null,leaseTokenHash:null,leaseExpiresAt:null,error:'LEASE_EXPIRED_SAFE_TO_RETRY'}});
+  const expired=await db.printJob.findMany({where:{status:{in:safeToRequeue},leaseExpiresAt:{lte:now}},select:{id:true,attempt:true}});
+  let requeued=0;
+  if(expired.length){
+    const recovered=await db.$transaction(expired.map(job=>db.printJob.updateMany({
+      where:{id:job.id,status:{in:safeToRequeue}},
+      data:{status:'QUEUED',claimedById:null,leaseTokenHash:null,leaseExpiresAt:null,attempt:Math.max(0,job.attempt-1),error:'LEASE_EXPIRED_SAFE_TO_RETRY'},
+    })));
+    requeued=recovered.reduce((sum,result)=>sum+result.count,0);
+  }
+  const recoveredAttempts=await db.printJob.updateMany({where:{status:'QUEUED',physicalStatus:'NOT_SUBMITTED',attempt:{gte:maxAttempts}},data:{attempt:0,nextAttemptAt:null,error:'ATTEMPTS_RESET_FOR_UNSUBMITTED_JOB'}});
   const uncertain=await db.printJob.findMany({where:{status:'SUBMITTING',leaseExpiresAt:{lte:now}},select:{id:true,orderId:true}});
   if(uncertain.length)await db.$transaction([
     db.printJob.updateMany({where:{id:{in:uncertain.map(j=>j.id)},status:'SUBMITTING'},data:{status:'OUTCOME_UNKNOWN',physicalStatus:'UNKNOWN',claimedById:null,leaseTokenHash:null,leaseExpiresAt:null,error:'AGENT_DISCONNECTED_DURING_SUBMISSION'}}),
   ]);
-  return {requeued:requeued.count,outcomeUnknown:uncertain.length};
+  if(recoveredAttempts.count)log('warn','agent.job.attempts.recovered',{count:recoveredAttempts.count});
+  return {requeued,outcomeUnknown:uncertain.length,attemptsRecovered:recoveredAttempts.count};
 }
 function leaseValid(job:{claimedById:string|null;leaseTokenHash:string|null;leaseExpiresAt:Date|null},agentId:string,token:string){return job.claimedById===agentId&&!!job.leaseTokenHash&&!!job.leaseExpiresAt&&job.leaseExpiresAt>new Date()&&verifySecret(token,job.leaseTokenHash);}
 
@@ -38,7 +48,7 @@ export function createAgentRouter(db:PrismaClient){
   let raceLostCount=0;
   const connectedDevices=await db.agentDevice.findMany({where:{shopId:agent.shopId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{printerId:true}});
   const connectedPrinterIds=new Set(connectedDevices.flatMap(device=>device.printerId?[device.printerId]:[]));
-  const canAdoptPrinter=(printerId:string|null,printerShopId:string|undefined)=>printerId===null||(printerShopId===agent.shopId&&!connectedPrinterIds.has(printerId));
+  const adoptJob=(job:{printerId:string|null;createdAt:Date;printer:{shopId:string}|null})=>canAdoptQueuedJob({printerId:job.printerId,createdAt:job.createdAt,printerShopId:job.printer?.shopId},agent,connectedPrinterIds,now);
   const claimed=await atomicClaimNext({
    candidate:async()=>{
     while(true){
@@ -46,10 +56,10 @@ export function createAgentRouter(db:PrismaClient){
       where:{status:'QUEUED',order:{shopId:agent.shopId},...(skipped.size?{id:{notIn:[...skipped]}}:{})},
       orderBy:{createdAt:'asc'},
       take:25,
-      select:{id:true,orderId:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,printer:{select:{shopId:true}}},
+      select:{id:true,orderId:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,createdAt:true,printer:{select:{shopId:true}}},
      });
      for(const candidate of candidates){
-      const reassignPrinter=candidate.printerId!==agent.printerId&&canAdoptPrinter(candidate.printerId,candidate.printer?.shopId);
+      const reassignPrinter=candidate.printerId!==agent.printerId&&adoptJob(candidate);
       const reason=candidate.claimedById&&candidate.leaseExpiresAt&&candidate.leaseExpiresAt>now?'ACTIVE_LEASE':claimSkipReason(candidate,agent,now,maxAttempts,reassignPrinter);
       if(reason){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason});continue;}
       const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
@@ -59,16 +69,17 @@ export function createAgentRouter(db:PrismaClient){
      if(candidates.length<25)return undefined;
     }
    },
-   claimIfQueued:async(candidate:{id:string;orderId:string;printerId:string|null;mode:string;attempt:number;maxAttempts:number;nextAttemptAt:Date|null;printer:{shopId:string}|null})=>{
+   claimIfQueued:async(candidate:{id:string;orderId:string;printerId:string|null;mode:string;attempt:number;maxAttempts:number;nextAttemptAt:Date|null;createdAt:Date;printer:{shopId:string}|null})=>{
     if(candidate.printerId!==agent.printerId&&candidate.printerId!==null){
+     if(candidate.printer&&candidate.printer.shopId!==agent.shopId){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PRINTER_MISMATCH'});return undefined;}
      const oldPrinterStillConnected=await db.agentDevice.findFirst({where:{shopId:agent.shopId,printerId:candidate.printerId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{id:true}});
-     if(candidate.printer?.shopId!==agent.shopId||oldPrinterStillConnected){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PRINTER_MISMATCH'});return undefined;}
+     if(oldPrinterStillConnected&&!adoptJob(candidate)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PRINTER_MISMATCH'});return undefined;}
     }
     const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
     if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PAYMENT_NOT_ELIGIBLE',paymentStatus:payment?.status??'MISSING'});return undefined;}
     token=`qpl_${randomUUID()}`;
     const updated=await db.printJob.updateMany({
-     where:{id:candidate.id,printerId:candidate.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],order:{shopId:agent.shopId}},
+     where:claimCasWhere(candidate),
      data:{printerId:agent.printerId,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
     });
     if(!updated.count){skipped.add(candidate.id);raceLostCount++;log('info','agent.job.claim.race_lost',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,candidatePrinterId:candidate.printerId,candidateMode:candidate.mode,attempt:candidate.attempt,maxAttempts:candidate.maxAttempts,nextAttemptAt:candidate.nextAttemptAt?.toISOString()??null});}
@@ -80,12 +91,12 @@ export function createAgentRouter(db:PrismaClient){
     db.printJob.count({where:{order:{shopId:agent.shopId}}}),
     db.printJob.count({where:{status:'QUEUED',order:{shopId:agent.shopId}}}),
    ]);
-   const queued=await db.printJob.findMany({where:{status:'QUEUED',order:{shopId:agent.shopId}},take:101,orderBy:{createdAt:'asc'},select:{id:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,printer:{select:{shopId:true}},order:{select:{payment:{select:{status:true}}}}}});
+   const queued=await db.printJob.findMany({where:{status:'QUEUED',order:{shopId:agent.shopId}},take:101,orderBy:{createdAt:'asc'},select:{id:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,createdAt:true,printer:{select:{shopId:true}},order:{select:{payment:{select:{status:true}}}}}});
    const inspected=queued.slice(0,100);
    const reasons:Record<string,number>={status:Math.max(0,allJobs-queuedCount),lease:0,printer:0,mode:0,payment:0,attempt:0,retry:0,eligible:0};
    const examples:Array<{jobId:string;reason:string;paymentStatus?:string}>=[];
    for(const job of inspected){
-    const reassignPrinter=job.printerId!==agent.printerId&&canAdoptPrinter(job.printerId,job.printer?.shopId);
+    const reassignPrinter=job.printerId!==agent.printerId&&adoptJob(job);
     const reason=job.claimedById&&job.leaseExpiresAt&&job.leaseExpiresAt>now?'ACTIVE_LEASE':claimSkipReason(job,agent,now,maxAttempts,reassignPrinter)??(canQueuePayment(job.order.payment?.status)?'ELIGIBLE':'PAYMENT_NOT_ELIGIBLE');
     const reasonKey=reason==='ACTIVE_LEASE'?'lease':reason==='PRINTER_MISMATCH'?'printer':reason==='MODE_MISMATCH'?'mode':reason==='PAYMENT_NOT_ELIGIBLE'?'payment':reason==='ATTEMPT_LIMIT'?'attempt':reason==='RETRY_SCHEDULED'?'retry':'eligible';
     reasons[reasonKey]=(reasons[reasonKey]??0)+1;
