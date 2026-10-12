@@ -1,4 +1,3 @@
-import {config} from 'dotenv';
 import express,{type NextFunction,type Request,type Response} from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -23,8 +22,11 @@ import {assertDatabaseTarget} from './database-target.js';
 import {createCorsPolicy} from './cors-policy.js';
 import {privateStorageRoot,writePrivatePdf,readPrivatePdf,removePrivatePdf,usesPrivateBlob,createPrivateUploadUrl,createPrivateDownloadUrl,privateDocumentKey,MAX_DOCUMENT_BYTES,checkPrivateBlob} from './private-storage.js';
 
-config({path:path.resolve(process.cwd(),'../../.env')});
-config({path:path.resolve(process.cwd(),'.env')});
+if(!process.env.VERCEL){
+  const {config}=await import('dotenv');
+  config({path:path.resolve(process.cwd(),'../../.env')});
+  config({path:path.resolve(process.cwd(),'.env')});
+}
 assertDatabaseTarget(process.env.MONGODB_URI,process.env.NODE_ENV==='test'?'qr_print_test':'qr_print');
 if(process.env.NODE_ENV==='production'&&!process.env.JWT_SECRET)throw new Error('JWT_SECRET must be configured in production.');
 if(process.env.VERCEL==='1'&&process.env.QRPRINT_STORAGE_PROVIDER!=='vercel-blob')throw new Error('Vercel Functions require QRPRINT_STORAGE_PROVIDER=vercel-blob; ephemeral filesystem storage is unsafe.');
@@ -166,4 +168,3 @@ app.use('/agent',createAgentRouter(db));
 app.use((err:unknown,_req:Request,res:Response,next:NextFunction)=>{void next;const e=err as {code?:string;message?:string};const status=err instanceof ZodError?400:e.code==='P2002'?409:e.code==='LIMIT_FILE_SIZE'?413:err instanceof Error&&err.message==='Only PDF files are accepted'?415:500;const code=err instanceof ZodError?'VALIDATION_ERROR':e.code==='P2002'?'DUPLICATE_RESOURCE':e.code==='LIMIT_FILE_SIZE'?'FILE_TOO_LARGE':status===415?'UNSUPPORTED_MEDIA_TYPE':'INTERNAL_ERROR';const message=err instanceof ZodError?'Request validation failed.':status===500?'Unexpected server error.':e.message||'Request failed.';log(status>=500?'error':'warn','http.error',{status,code,message:e.message});res.status(status).json({error:{code,message}});});
 return app;
 }
-if(process.env.NODE_ENV!=='test'&&process.env.VERCEL!=='1'){const app=createApp();const port=Number(process.env.API_PORT||4000);app.listen(port,()=>log('info','api.started',{port,executionMode}));}
