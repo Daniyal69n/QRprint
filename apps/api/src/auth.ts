@@ -24,4 +24,4 @@ export const requireRole = (...roles:Role[]) => (req:AuthRequest,res:Response,ne
   if (!req.user || !roles.includes(req.user.role)) return res.status(403).json({error:'Insufficient role'});
   next();
 };
-export const issueToken = (id:string,role:Role) => jwt.sign({id,role},secret(),{expiresIn:'12h'});
+export const issueToken = (id:string,role:Role,expiresIn:jwt.SignOptions['expiresIn']='12h') => jwt.sign({id,role},secret(),{expiresIn});

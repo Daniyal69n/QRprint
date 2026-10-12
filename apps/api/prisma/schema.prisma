@@ -62,6 +62,7 @@ model User {
   passwordHash String
   role         Role         @default(CUSTOMER)
   isActive     Boolean      @default(true)
+  isGuest      Boolean      @default(false)
   createdAt    DateTime     @default(now())
   shops        Shop[]
   orders       Order[]

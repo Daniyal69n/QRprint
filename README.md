@@ -32,7 +32,7 @@ Prisma MongoDB uses `db push`, not SQL migrations. The SQL migration files in th
 2. Choose **Create a new shop-owner account** or **Sign in to an existing shop-owner account**. New registration creates only a `SHOP_OWNER` account and its first shop; no administrator account or manual approval is required. Existing owners can select one of their shops or create another.
 3. Connect the printer and install its Windows driver/add its queue before continuing. After sign-in, the wizard automatically lists installed queues; if you connect the printer while the wizard is open, click **Rescan installed queues**. Select a queue to register and enroll the Windows Agent. Double-sided printing is offered only when the selected driver reports duplex support. If no printer is installed, finish creating the shop and QR without registering a made-up queue; install a printer and run the wizard again to enroll the Agent later.
 4. The wizard displays the shop QR generated from the Production `PUBLIC_APP_URL` and lets the owner download it as a PNG. Device credentials are stored using current-user Windows DPAPI. Do not share the owner password or device credential.
-5. The owner can set per-page prices in the owner panel. A customer scans the shop-specific QR, uploads a PDF, chooses paper, copies, color and—only when enabled by that shop—single/double-sided printing, then submits.
+5. The owner signs in at `/owner` to set per-page prices, shop details, and the print queue. A customer scans the shop-specific QR, uploads a PDF without creating an account, chooses paper, copies, color and—only when enabled by that shop—single/double-sided printing, then submits.
 6. PDFs are stored outside MongoDB. Local API storage is under `QRPRINT_STORAGE_DIR` and defaults to a 30-day cleanup policy. The shop agent holds its spool encrypted on that PC under `%LOCALAPPDATA%\QRPrint\Jobs`; decrypted submission copies are temporary.
 
 The order price continues to use each printed page's configured price; duplex changes how the printer lays out the pages, not the per-page tariff. Owners can account for their local business pricing in the per-page price.
@@ -48,7 +48,7 @@ The order price continues to use each printed page's configured price; duplex ch
 
 ## Administration
 
-At `/admin`, a `SUPER_ADMIN` can provision shop owners, pause/reactivate customer or owner accounts, activate/deactivate shops, review recent audit events, adjust the platform commission estimate, and configure the transfer details shown at customer checkout. Deactivating an account blocks new sign-ins and authenticated API/agent calls; shop activation remains an independent control. Shop-owner credentials should be delivered through a secure channel.
+At `/admin`, a `SUPER_ADMIN` can view registered owner names and emails, printer queues and agent status; provision shop owners; pause/reactivate customer or owner accounts; activate/deactivate shops; review recent audit events; adjust the platform commission estimate; and configure the transfer details shown at customer checkout. Deactivating an account blocks new sign-ins and authenticated API/agent calls; shop activation remains an independent control. Shop-owner credentials should be delivered through a secure channel.
 
 ## Useful commands
 

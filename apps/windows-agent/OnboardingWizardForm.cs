@@ -45,7 +45,7 @@ public sealed class OnboardingWizardForm : Form {
         AddSection(card,"2. Shop-owner account");
         var accountChoice=new FlowLayoutPanel{AutoSize=true,FlowDirection=FlowDirection.TopDown,WrapContents=false,Dock=DockStyle.Fill};
         accountChoice.Controls.Add(createAccount);accountChoice.Controls.Add(existingAccount);AddRow(card,"Choose an option",accountChoice);
-        AddRow(card,"Owner name",ownerName);AddRow(card,"Email",email);AddRow(card,"Password",password);
+        AddRow(card,"Owner name",ownerName);AddRow(card,"Email",email);AddRow(card,"Password",password);AddRow(card,"",new Label{Text="Use at least 12 characters. Maximum length is 72 UTF-8 bytes.",AutoSize=true,MaximumSize=new Size(560,0),ForeColor=Color.FromArgb(72,91,105)});
         AddRow(card,"",connect);
         AddSection(card,"3. Shop and printer");
         AddRow(card,"Shop URL slug tip",new Label{Text="Use lowercase letters, numbers, and hyphens. For example, “Elite” becomes “elite”.",AutoSize=true,MaximumSize=new Size(560,0),ForeColor=Color.FromArgb(72,91,105)});
@@ -173,7 +173,7 @@ public sealed class OnboardingWizardForm : Form {
                     ? $"Signed in as shop owner. Server print mode: {mode}. Select a shop or create one."
                     : $"Shop-owner account and shop created. Server print mode: {mode}.";
         } catch(Exception ex) {
-            password.Clear();status.Text=ex.Message;
+            status.Text=ex.Message;
         } finally {
             connect.Enabled=!signedIn;UpdateAccountFields();UpdateSetupEnabled();
         }

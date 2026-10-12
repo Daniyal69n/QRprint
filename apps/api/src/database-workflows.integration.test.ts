@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { once } from 'node:events';
+import jwt from 'jsonwebtoken';
 import { PDFDocument } from 'pdf-lib';
 import { PrismaClient } from '@prisma/client';
 import { issueToken } from './auth.js';
@@ -81,11 +82,37 @@ test('public shop-owner registration atomically creates a fixed-role owner and s
   assert.equal(ownerShops.status,200);
   const shops=await ownerShops.json() as Array<{id:string;slug:string}>;
   assert.deepEqual(shops.map(shop=>shop.id),[owner.shops[0]!.id]);
+  const ownerProfile=await fetch(`${baseUrl}/owner/profile`,{headers:{authorization:`Bearer ${issueToken(owner.id,'SHOP_OWNER')}`}});
+  assert.equal(ownerProfile.status,200);
+  const profile=await ownerProfile.json() as {name:string;email:string;shops:Array<{id:string;slug:string}>};
+  assert.equal(profile.name,'Self-service Owner');
+  assert.equal(profile.email,email);
+  assert.equal(profile.shops[0]?.id,owner.shops[0]!.id);
 
   const qr=await fetch(`${baseUrl}/shops/${encodeURIComponent(slug)}/qr.png`);
   assert.equal(qr.status,200);
   assert.match(qr.headers.get('content-type')??'',/image\/png/);
   assert.deepEqual(Array.from(new Uint8Array(await qr.arrayBuffer()).slice(0,8)),[137,80,78,71,13,10,26,10]);
+});
+
+test('public guest checkout gets a short-lived customer session without an account login',async()=>{
+  const roleOverride=await fetch(`${baseUrl}/auth/guest`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({role:'SUPER_ADMIN'})});
+  assert.equal(roleOverride.status,400,'guest registration does not accept a client-selected role');
+  const response=await fetch(`${baseUrl}/auth/guest`,{method:'POST',headers:{'content-type':'application/json'},body:'{}'});
+  assert.equal(response.status,201);
+  const session=await response.json() as {token:string;role:string};
+  assert.equal(session.role,'CUSTOMER');
+  assert.ok(session.token);
+  const claims=jwt.decode(session.token) as {id:string;iat:number;exp:number};
+  assert.equal(claims.exp-claims.iat,7200,'guest sessions expire after two hours');
+  const user=await db.user.findUniqueOrThrow({where:{id:claims.id}});
+  userIds.push(user.id);
+  assert.match(user.email,/^guest-[0-9a-f-]+@guest\.qrprint\.invalid$/);
+  assert.equal(user.name,null);
+  const shops=await fetch(`${baseUrl}/owner/shops`,{headers:{authorization:`Bearer ${session.token}`}});
+  assert.equal(shops.status,403);
+  const profile=await fetch(`${baseUrl}/owner/profile`,{headers:{authorization:`Bearer ${session.token}`}});
+  assert.equal(profile.status,403);
 });
 
 after(async () => {
