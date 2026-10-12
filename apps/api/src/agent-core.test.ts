@@ -4,6 +4,7 @@ import type {PrismaClient} from '@prisma/client';
 import type {Response} from 'express';
 import {atomicClaimNext,canAdoptQueuedJob,canAgentUseShop,canQueuePayment,claimCasWhere,claimSkipReason,expiredLeaseAction,isAgentCredential,mintAgentSecret,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
+import {describeDocumentDelivery,documentDownloadRequiresLease,fittedBlobKey,redactDocumentUrl} from './agent-document.js';
 
 test('agent credential format rejects missing or malformed secrets',()=>{const key=mintAgentSecret();assert.equal(isAgentCredential(key),true);assert.equal(isAgentCredential('agent-password'),false);});
 test('unauthorized agent is rejected before database lookup',async()=>{let code=0;let body:unknown;const response={status(n:number){code=n;return this;},json(value:unknown){body=value;return this;}};await authenticateAgent({} as PrismaClient)({headers:{authorization:'Bearer invalid'}} as AgentRequest,response as unknown as Response,()=>assert.fail('next must not be called'));assert.equal(code,401);assert.equal((body as {error:{code:string}}).error.code,'AGENT_UNAUTHORIZED');});
@@ -35,4 +36,17 @@ test('claim compare-and-set filter avoids MongoDB null-OR, printerId, and relati
   assert.equal('printerId' in where,false);
   assert.equal('attempt' in where,false);
   assert.equal('nextAttemptAt' in where,false);
+});
+test('fitted document download is lease-authenticated and never logs signed URL query tokens',()=>{
+  const jobId='cmv55r70w0007jk06ig06lut9';
+  assert.equal(fittedBlobKey(jobId),`agent-jobs/${jobId}.pdf`);
+  assert.deepEqual(describeDocumentDelivery(true),{contentType:'application/json',storage:'private-blob-fitted'});
+  assert.deepEqual(describeDocumentDelivery(false),{contentType:'application/pdf',storage:'inline-fitted'});
+  assert.deepEqual(documentDownloadRequiresLease({authorization:'Bearer qpa_test','x-job-lease':'qpl_test'}),{hasAuthorization:true,hasJobLease:true});
+  assert.equal(documentDownloadRequiresLease({}).hasJobLease,false);
+  const signed='https://blob.vercel-storage.com/agent-jobs/cmv55r70w0007jk06ig06lut9.pdf?payload=secret-token';
+  const redacted=redactDocumentUrl(signed);
+  assert.equal(redacted,'https://blob.vercel-storage.com/[redacted]');
+  assert.equal(redacted.includes('secret-token'),false);
+  assert.equal(redacted.includes('?'),false);
 });

@@ -71,15 +71,19 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
             if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
             var duplex = doubleSided ? "duplexlong" : "simplex";
             var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
+            Console.WriteLine($"Print command: {Path.GetFileName(renderer)} to queue '{queueName}' (duplex={duplex}).");
             using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
             if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
             using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
             try { await process.WaitForExitAsync(timeout.Token); }
             catch(OperationCanceledException) {
                 try { process.Kill(entireProcessTree:true); } catch {}
+                Console.Error.WriteLine($"Print process timed out for queue '{queueName}'.");
                 return new(false,"OUTCOME_UNKNOWN",queueName,"PDF renderer did not finish within two minutes; submission outcome is unknown.");
             }
+            Console.WriteLine($"Print process exit code: {process.ExitCode}.");
             if (process.ExitCode != 0) return new(false,"FAILED",queueName,$"PDF renderer exited with code {process.ExitCode}.");
+            Console.WriteLine($"Spooler submission accepted for queue '{queueName}'.");
             return new(true,"SPOOLER_ACCEPTED",queueName,"The configured renderer returned success and the queue was not marked unavailable. This does not confirm paper output.");
         }
         return await SubmitViaPrintToAsync(queueName, pdfPath, doubleSided);
@@ -108,13 +112,20 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         };
         if (!info.Verbs.Any(verb => verb.Equals("printto", StringComparison.OrdinalIgnoreCase)))
             return new(false,"UNAVAILABLE",queueName,"This PC has no PrintTo handler for PDF files. Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND.");
+        Console.WriteLine($"Print command: Windows PrintTo verb to queue '{queueName}'.");
         using var process = Process.Start(info);
-        if (process is null) return new(true,"SPOOLER_ACCEPTED",queueName,"Windows handed the PDF to the PrintTo handler. Physical output remains unconfirmed.");
+        if (process is null) {
+            Console.WriteLine("Spooler submission handed to PrintTo handler (no process handle).");
+            return new(true,"SPOOLER_ACCEPTED",queueName,"Windows handed the PDF to the PrintTo handler. Physical output remains unconfirmed.");
+        }
         using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
         try { await process.WaitForExitAsync(timeout.Token); }
         catch(OperationCanceledException) {
+            Console.WriteLine("Print process still running after two minutes; treating spooler handoff as accepted.");
             return new(true,"SPOOLER_ACCEPTED",queueName,"Windows PrintTo was started. The handler is still running; physical output remains unconfirmed.");
         }
+        Console.WriteLine($"Print process exit code: {process.ExitCode}.");
+        Console.WriteLine($"Spooler submission completed for queue '{queueName}'.");
         return new(true,"SPOOLER_ACCEPTED",queueName,"Windows PrintTo completed. Physical output remains unconfirmed.");
     }
 }
@@ -134,8 +145,14 @@ public static class Program {
     private static async Task ReportAsync(AgentApiClient api,string jobId,string leaseToken,string status,string eventKey,string? error=null,string? externalJobId=null) {
         Exception? last=null;
         for(var attempt=0;attempt<4;attempt++){
-            try { using var response=await api.PostAsync($"agent/jobs/{Uri.EscapeDataString(jobId)}/status",new {eventKey,status,leaseToken,error,externalJobId});return; }
-            catch(Exception ex) when(attempt<3){last=ex;await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2,attempt)));}
+            try {
+                using var response=await api.PostStatusAsync(jobId,new {eventKey,status,leaseToken,error,externalJobId});
+                var accepted=response.RootElement.TryGetProperty("status",out var reported)?reported.GetString():status;
+                Console.WriteLine($"Job {jobId}: status-event API accepted {accepted} (attempt {attempt+1}).");
+                return;
+            }
+            catch(Exception ex) when(attempt<3){last=ex;Console.Error.WriteLine($"Job {jobId}: status-event API failed for {status}: {ex.Message}; retrying.");await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2,attempt)));}
+            catch(Exception ex){last=ex;}
         }
         throw new InvalidOperationException("Could not report agent job status; the lease will expire and submission outcome will be reconciled.",last);
     }
@@ -220,6 +237,64 @@ public static class Program {
         catch(Exception ex){Console.Error.WriteLine($"Job result retained for retry after reconnection: {ex.Message}");}
     }
 
+    private static async Task ProcessClaimedJobAsync(AgentApiClient api,IPrinterAdapter adapter,string shopId,string queueName,string mode,string id,string token) {
+        var deliveryStage="loading print options";
+        try {
+            Console.WriteLine($"Job {id}: print-options request started.");
+            using var options=await api.GetJobPrintOptionsAsync(id,token);
+            var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
+            Console.WriteLine($"Job {id}: print-options completed; duplex={doubleSided}.");
+            deliveryStage="downloading fitted PDF";
+            Console.WriteLine($"Job {id}: download started (GET agent/jobs/{{id}}/document, X-Job-Lease present, timeout {AgentDocument.DocumentTimeoutSeconds}s).");
+            var downloaded=await api.DownloadAsync(id,token);
+            Console.WriteLine($"Job {id}: download completed; http={downloaded.StatusCode}; contentType={downloaded.ContentType}; source={downloaded.Source}; bytes={downloaded.ByteCount}; origin={downloaded.StorageHost??"api"}; elapsedMs={downloaded.ElapsedMs}.");
+            deliveryStage="validating local PDF";
+            if(!AgentDocument.HasPdfMagic(downloaded.Bytes))throw new InvalidOperationException("Fitted document failed PDF magic validation.");
+            Console.WriteLine($"Job {id}: local PDF validation passed.");
+            deliveryStage="saving encrypted local spool copy";
+            var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,downloaded.Bytes);
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(downloaded.Bytes);
+            Console.WriteLine($"Job {id}: encrypted spool saved.");
+            deliveryStage="submitting to printer";
+            await SyncSpoolEntryAsync(api,adapter,local);
+        } catch(Exception ex) {
+            var canceled=ex is OperationCanceledException or TaskCanceledException;
+            Console.Error.WriteLine($"Job {id} failed during {deliveryStage}; {ex.GetType().Name}: {ex.Message}");
+            if(canceled)Console.Error.WriteLine($"Job {id}: request canceled while waiting for fitted PDF headers or body. No print was submitted.");
+            var reported=await TryReportPreSubmissionFailureAsync(api,id,token,deliveryStage,ex);
+            if(!reported)await WaitForLeaseReleaseAsync(api,id,token);
+        }
+    }
+
+    private static async Task<bool> TryReportPreSubmissionFailureAsync(AgentApiClient api,string jobId,string leaseToken,string deliveryStage,Exception ex) {
+        var detail=$"{deliveryStage}: {ex.GetType().Name}: {ex.Message}";
+        if(detail.Length>450)detail=detail[..450];
+        try {
+            await ReportAsync(api,jobId,leaseToken,"FAILED",$"download-{Guid.NewGuid():N}",detail);
+            Console.WriteLine($"Job {jobId}: pre-submission failure reported; not retrying print for this lease.");
+            return true;
+        } catch(Exception reportEx) {
+            Console.Error.WriteLine($"Job {jobId}: could not report {deliveryStage} failure: {reportEx.Message}");
+            return false;
+        }
+    }
+
+    private static async Task WaitForLeaseReleaseAsync(AgentApiClient api,string jobId,string leaseToken) {
+        Console.WriteLine($"Job {jobId}: waiting for lease release before claiming another job.");
+        for(var i=0;i<18;i++){
+            try {
+                using var state=await api.GetJobStateAsync(jobId,leaseToken);
+                var status=state.RootElement.GetProperty("status").GetString()??"";
+                var owned=state.RootElement.GetProperty("leaseOwned").GetBoolean();
+                Console.WriteLine($"Job {jobId}: state={status}; leaseOwned={owned}.");
+                if(!owned||status is "QUEUED" or "FAILED" or "CANCELLED" or "SPOOLER_ACCEPTED" or "SIMULATED_COMPLETE" or "OUTCOME_UNKNOWN")return;
+            } catch(Exception ex) {
+                Console.Error.WriteLine($"Job {jobId}: lease poll failed: {ex.Message}");
+            }
+            await Task.Delay(TimeSpan.FromSeconds(5));
+        }
+    }
+
     private static async Task RunConnectedAsync(string baseUrl,string credential,string requestedMode){
         using var api=new AgentApiClient(baseUrl,credential);
         using var stop=new CancellationTokenSource();
@@ -246,7 +321,9 @@ public static class Program {
                 Console.WriteLine("SIMULATED ONLY: this agent will not inspect or access a Windows printer queue.");
             }
             keepAlive=Task.Run(async()=>{while(!stop.IsCancellationRequested){try{if(mode=="REAL"){var current=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.Ordinal))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);using var h=await api.PostAsync("agent/heartbeat",new {observedQueue=ToObservedQueue(current)},stop.Token);Console.WriteLine($"Heartbeat accepted; assigned queue status: {current.Status}.");}else{using var h=await api.PostAsync("agent/heartbeat",new {ping=true},stop.Token);Console.WriteLine("Simulated heartbeat accepted; no Windows printer queue was accessed.");}}catch(OperationCanceledException) when(stop.IsCancellationRequested){break;}catch(Exception ex){Console.Error.WriteLine($"API heartbeat failed: {ex.Message}");}try{await Task.Delay(TimeSpan.FromSeconds(15),stop.Token);}catch(OperationCanceledException){break;}}});
+            string? inFlightJobId=null;
             while(true){
+                if(!AgentDocument.CanClaimNext(inFlightJobId)){Console.Error.WriteLine($"Refusing to claim another job while {inFlightJobId} is in flight.");await Task.Delay(TimeSpan.FromSeconds(5));continue;}
                 foreach(var localJob in await AgentLocalSpool.LoadAllAsync(shopId))await SyncSpoolEntryAsync(api,adapter,localJob);
                 JsonDocument claim;
                 try { claim=await api.PostAsync("agent/jobs/claim",new {ping=true}); }
@@ -255,17 +332,10 @@ public static class Program {
                 var job=claimDocument.RootElement.GetProperty("job");
                 if(job.ValueKind==JsonValueKind.Null){var diagnostics=claimDocument.RootElement.TryGetProperty("diagnostics",out var details)?details:default;var reason=diagnostics.ValueKind==JsonValueKind.Object&&diagnostics.TryGetProperty("reasons",out var reasons)?reasons.ToString():"unavailable";var examples=diagnostics.ValueKind==JsonValueKind.Object&&diagnostics.TryGetProperty("examples",out var sample)?sample.ToString():"[]";Console.WriteLine($"No eligible queued job for agent printer '{queueName}' ({mode}); claim reasons: {reason}; examples: {examples}.");await Task.Delay(TimeSpan.FromSeconds(10));continue;}
                 var id=job.GetProperty("id").GetString()!;var token=job.GetProperty("leaseToken").GetString()!;
-                Console.WriteLine($"Claimed job {id} ({mode}); downloading fitted PDF.");
-                var deliveryStage="loading print options";
-                try {
-                    using var options=await api.GetJobPrintOptionsAsync(id,token);
-                    var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
-                    deliveryStage="downloading fitted PDF";
-                    var bytes=await api.DownloadAsync(id,token);
-                    deliveryStage="saving encrypted local spool copy";
-                    var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
-                    await SyncSpoolEntryAsync(api,adapter,local);
-                } catch(Exception ex){Console.Error.WriteLine($"Job {id} failed during {deliveryStage}; it was not submitted by this attempt: {ex.Message}");}
+                inFlightJobId=id;
+                Console.WriteLine($"Claimed job {id} ({mode}); processing this job to submission or a reported failure before claiming another.");
+                try { await ProcessClaimedJobAsync(api,adapter,shopId,queueName,mode,id,token); }
+                finally { inFlightJobId=null; }
             }
         } finally {stop.Cancel();if(keepAlive is not null)try{await keepAlive;}catch{}}
     }

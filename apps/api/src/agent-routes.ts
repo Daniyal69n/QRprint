@@ -6,6 +6,7 @@ import {authenticateAgent,type AgentRequest} from './agent-auth.js';
 import {hashSecret,canTransitionJob,canQueuePayment,canAdoptQueuedJob,claimCasWhere,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
 import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl} from './private-storage.js';
+import {describeDocumentDelivery,fittedBlobKey} from './agent-document.js';
 
 const leaseSeconds=Math.max(15,Math.min(300,Number(process.env.AGENT_LEASE_SECONDS)||60));
 const maxAttempts=Math.max(1,Math.min(10,Number(process.env.PRINT_MAX_ATTEMPTS)||3));
@@ -114,31 +115,37 @@ export function createAgentRouter(db:PrismaClient){
  router.get('/jobs/:id/state',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,id=routeParam(req,"id");await reapExpired(db);const job=await db.printJob.findUnique({where:{id},select:{id:true,printerId:true,mode:true,status:true,physicalStatus:true,claimedById:true,leaseTokenHash:true,leaseExpiresAt:true,order:{select:{shopId:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');const supplied=String(req.headers['x-job-lease']||'');res.json({id:job.id,status:job.status,physicalStatus:job.physicalStatus,leaseExpiresAt:job.leaseExpiresAt?.toISOString()??null,leaseOwned:!!supplied&&leaseValid(job,agent.id,supplied),claimedByThisAgent:job.claimedById===agent.id});}catch(e){next(e);}});
  router.get('/jobs/:id/print-options',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,token=String(req.headers['x-job-lease']||'');const job=await db.printJob.findUnique({where:{id:routeParam(req,'id')},include:{order:{select:{shopId:true,doubleSided:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');if(!leaseValid(job,agent.id,token))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');res.setHeader('Cache-Control','private, no-store');res.json({doubleSided:job.order.doubleSided});}catch(e){next(e);}});
  router.get('/jobs/:id/document',async(req:AgentRequest,res,next)=>{
-  const agent=req.agent!,jobId=String(req.params.id);
+  const agent=req.agent!,jobId=String(req.params.id),started=Date.now();
   try{
    const token=String(req.headers['x-job-lease']||'');
+   if(!token)return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');
    const job=await db.printJob.findUnique({where:{id:routeParam(req,'id')},include:{order:{include:{document:true}}}});
    if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');
    if(!leaseValid(job,agent.id,token))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');
    if(!['LEASED','DOWNLOADED'].includes(job.status))return fail(res,409,'JOB_NOT_DOWNLOADABLE','Job is not ready for download.');
    const doc=job.order.document;
    if(doc.deletedAt)return fail(res,410,'DOCUMENT_EXPIRED','The source document is no longer retained.');
-   const fitted=await fitPdf(await readPrivatePdf(doc.storageKey),{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});
+   const sourceKey=doc.storageKey;
+   const fitted=await fitPdf(await readPrivatePdf(sourceKey),{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});
    if(job.status==='LEASED')await db.printJob.updateMany({where:{id:job.id,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token)},data:{status:'DOWNLOADED'}});
    res.setHeader('Cache-Control','private, no-store');
    res.setHeader('X-Print-Job-Id',job.id);
    res.setHeader('X-Page-Count',String(fitted.pageCount));
    const bytes=Buffer.from(fitted.pdf);
+   const delivery=describeDocumentDelivery(usesPrivateBlob());
    if(usesPrivateBlob()){
-    const key=`agent-jobs/${job.id}.pdf`;
+    const key=fittedBlobKey(job.id);
     await writePrivatePdf(key,bytes,{overwrite:true});
-    return res.json({downloadUrl:await createPrivateDownloadUrl(key),pageCount:fitted.pageCount,expiresInSeconds:300});
+    const downloadUrl=await createPrivateDownloadUrl(key);
+    log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount:fitted.pageCount,contentType:delivery.contentType,storage:delivery.storage,fittedKey:key,sourceStored:true,durationMs:Date.now()-started});
+    return res.json({downloadUrl,pageCount:fitted.pageCount,expiresInSeconds:300});
    }
+   log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount:fitted.pageCount,contentType:delivery.contentType,storage:delivery.storage,durationMs:Date.now()-started});
    res.setHeader('Content-Type','application/pdf');
    res.setHeader('Content-Disposition',`attachment; filename="${job.id}.pdf"`);
    res.send(bytes);
   }catch(e){
-   log('error','agent.job.document.download_failed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId,errorType:e instanceof Error?e.name:'unknown'});
+   log('error','agent.job.document.download_failed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId,errorType:e instanceof Error?e.name:'unknown',durationMs:Date.now()-started});
    next(e);
   }
  });

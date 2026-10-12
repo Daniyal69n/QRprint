@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -5,9 +6,10 @@ using System.Text.Json;
 namespace QRPrint.Agent;
 
 public sealed class AgentApiClient : IDisposable {
+    public static readonly TimeSpan DocumentTimeout=TimeSpan.FromSeconds(AgentDocument.DocumentTimeoutSeconds);
     private readonly HttpClient client;
     public AgentApiClient(string baseUrl,string? credential=null) {
-        client=new HttpClient { BaseAddress=new Uri(baseUrl.TrimEnd('/')+"/"),Timeout=TimeSpan.FromSeconds(25) };
+        client=new HttpClient { BaseAddress=new Uri(baseUrl.TrimEnd('/')+"/"),Timeout=DocumentTimeout };
         if(!string.IsNullOrWhiteSpace(credential))client.DefaultRequestHeaders.Authorization=new AuthenticationHeaderValue("Bearer",credential);
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
@@ -45,22 +47,45 @@ public sealed class AgentApiClient : IDisposable {
         if(!response.IsSuccessStatusCode)throw CreateApiException("agent print options",response.StatusCode,payload);
         return JsonDocument.Parse(payload);
     }
-    public async Task<byte[]> DownloadAsync(string jobId,string leaseToken,CancellationToken ct=default) {
+    public async Task<DocumentDownloadResult> DownloadAsync(string jobId,string leaseToken,CancellationToken ct=default) {
+        var started=Stopwatch.StartNew();
         using var request=new HttpRequestMessage(HttpMethod.Get,$"agent/jobs/{Uri.EscapeDataString(jobId)}/document");
         request.Headers.Add("X-Job-Lease",leaseToken);
-        using var response=await client.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,ct);
-        if(!response.IsSuccessStatusCode)throw CreateApiException("agent document download",response.StatusCode,await response.Content.ReadAsStringAsync(ct));
-        if(response.Content.Headers.ContentType?.MediaType?.Equals("application/json",StringComparison.OrdinalIgnoreCase)==true){
-            using var payload=JsonDocument.Parse(await response.Content.ReadAsStringAsync(ct));
-            var uri=new Uri(payload.RootElement.GetProperty("downloadUrl").GetString()??throw new InvalidOperationException("API did not return a document URL."));
+        request.Headers.Accept.ParseAdd("application/pdf");
+        request.Headers.Accept.ParseAdd("application/json");
+        using var timeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(DocumentTimeout);
+        using var response=await client.SendAsync(request,HttpCompletionOption.ResponseHeadersRead,timeout.Token);
+        var contentType=response.Content.Headers.ContentType?.MediaType??"missing";
+        var status=(int)response.StatusCode;
+        if(!response.IsSuccessStatusCode)throw CreateApiException("agent document download",response.StatusCode,await response.Content.ReadAsStringAsync(timeout.Token));
+        byte[] bytes;
+        string source;
+        string? storageHost=null;
+        if(contentType.Equals("application/json",StringComparison.OrdinalIgnoreCase)){
+            using var payload=JsonDocument.Parse(await response.Content.ReadAsStringAsync(timeout.Token));
+            var rawUrl=payload.RootElement.GetProperty("downloadUrl").GetString()??throw new InvalidOperationException("API did not return a document URL.");
+            var uri=new Uri(rawUrl);
+            storageHost=AgentDocument.DescribeOrigin(rawUrl);
             if(uri.Scheme!="https")throw new InvalidOperationException("Private document URL must use HTTPS.");
-            // Use an unauthenticated client: the agent bearer token is scoped to the API and must never be sent to Blob.
-            using var storageClient=new HttpClient{Timeout=TimeSpan.FromMinutes(2)};
-            using var download=await storageClient.GetAsync(uri,HttpCompletionOption.ResponseHeadersRead,ct);
-            if(!download.IsSuccessStatusCode)throw new HttpRequestException($"Private document download returned {(int)download.StatusCode}.");
-            return await download.Content.ReadAsByteArrayAsync(ct);
+            using var storageClient=new HttpClient{Timeout=DocumentTimeout};
+            using var download=await storageClient.GetAsync(uri,HttpCompletionOption.ResponseHeadersRead,timeout.Token);
+            var blobStatus=(int)download.StatusCode;
+            if(!download.IsSuccessStatusCode)throw new HttpRequestException($"Private document download returned {blobStatus} from {storageHost}.");
+            bytes=await download.Content.ReadAsByteArrayAsync(timeout.Token);
+            source="signed-blob";
+            status=blobStatus;
+            contentType=download.Content.Headers.ContentType?.MediaType??contentType;
+        } else {
+            bytes=await response.Content.ReadAsByteArrayAsync(timeout.Token);
+            source="inline-pdf";
         }
-        return await response.Content.ReadAsByteArrayAsync(ct);
+        if(!AgentDocument.HasPdfMagic(bytes))throw new InvalidOperationException($"Fitted document from {source} is not a PDF ({bytes.Length} bytes, content-type {contentType}).");
+        return new DocumentDownloadResult(bytes,status,contentType,source,bytes.Length,storageHost,started.ElapsedMilliseconds);
+    }
+
+    public async Task<JsonDocument> PostStatusAsync(string jobId,object body,CancellationToken ct=default) {
+        return await PostAsync($"agent/jobs/{Uri.EscapeDataString(jobId)}/status",body,ct);
     }
     public async Task<byte[]> GetBytesAsync(string route,CancellationToken ct=default) {
         using var response=await client.GetAsync(route,HttpCompletionOption.ResponseHeadersRead,ct);
