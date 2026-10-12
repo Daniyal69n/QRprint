@@ -4,7 +4,8 @@
     "api": {
       "root": "apps/api",
       "framework": "express",
-      "entrypoint": "index.mjs"
+      "entrypoint": "index.mjs",
+      "buildCommand": "npm run build:vercel"
     },
     "web": {
       "root": "apps/web",

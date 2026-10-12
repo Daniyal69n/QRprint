@@ -2,7 +2,6 @@ node_modules/
 .npm-cache/
 .next/
 dist/
-apps/api/index.mjs
 **/storage/
 .vercel/
 *.tsbuildinfo
