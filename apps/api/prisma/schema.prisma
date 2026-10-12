@@ -22,6 +22,7 @@ enum OrderStatus {
 enum PaymentStatus {
   PENDING
   SUBMITTED
+  CUSTOMER_ATTESTED
   VERIFIED
   CASH_AUTHORIZED
   FAILED
