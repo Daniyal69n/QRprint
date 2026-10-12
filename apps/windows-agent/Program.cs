@@ -56,6 +56,7 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
 
     public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false) {
         if (!OperatingSystem.IsWindows()) return new(false,"UNAVAILABLE",queueName,"Windows printer queues are available only on Windows.");
+        if (!PrinterSettings.InstalledPrinters.Cast<string>().Any(name=>string.Equals(name,queueName,StringComparison.Ordinal))) return new(false,"UNAVAILABLE",queueName,"The exact assigned Windows printer queue is not installed; no fallback queue was used.");
         var settings = new PrinterSettings { PrinterName = queueName };
         if (!settings.IsValid) return new(false,"UNAVAILABLE",queueName,"The selected printer queue is not installed or available.");
         if (doubleSided && !settings.CanDuplex) return new(false,"FAILED",queueName,"The selected Windows driver does not report double-sided printing support.");
@@ -72,7 +73,12 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
         using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
         if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
-        await process.WaitForExitAsync();
+        using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch(OperationCanceledException) {
+            try { process.Kill(entireProcessTree:true); } catch {}
+            return new(false,"OUTCOME_UNKNOWN",queueName,"PDF renderer did not finish within two minutes; submission outcome is unknown.");
+        }
         if (process.ExitCode != 0) return new(false,"FAILED",queueName,$"PDF renderer exited with code {process.ExitCode}.");
         return new(true,"SPOOLER_ACCEPTED",queueName,"The configured renderer returned success and the queue was not marked unavailable. This does not confirm paper output.");
     }
@@ -151,15 +157,17 @@ public static class Program {
     }
 
     private static async Task SubmitDownloadedAsync(AgentApiClient api,IPrinterAdapter adapter,LocalPrintJob entry) {
-        var available=(await adapter.DiscoverAsync()).Any(p=>p.Name.Equals(entry.QueueName,StringComparison.OrdinalIgnoreCase)&&p.Available);
-        if(entry.Mode=="REAL"&&!available){entry=await SetPendingResultAsync(entry,"FAILED","Assigned Windows queue is unavailable before submission; no print was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch{}return;}
+        Console.WriteLine($"Preparing job {entry.Id} for exact printer queue '{entry.QueueName}'.");
+        var available=(await adapter.DiscoverAsync()).Any(p=>p.Name.Equals(entry.QueueName,StringComparison.Ordinal)&&p.Available);
+        if(entry.Mode=="REAL"&&!available){Console.Error.WriteLine($"Job {entry.Id} was not submitted: exact assigned queue '{entry.QueueName}' is missing or unavailable.");entry=await SetPendingResultAsync(entry,"FAILED","Assigned Windows queue is unavailable before submission; no print was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report queue-unavailable status for job {entry.Id}: {ex.Message}");}return;}
         var renderer=Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
-        if(entry.Mode=="REAL"&&(string.IsNullOrWhiteSpace(renderer)||!File.Exists(renderer))){entry=await SetPendingResultAsync(entry,"FAILED","Trusted PDF renderer is not configured; no submission was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch{}return;}
+        if(entry.Mode=="REAL"&&(string.IsNullOrWhiteSpace(renderer)||!File.Exists(renderer))){Console.Error.WriteLine($"Job {entry.Id} was not submitted: configure QRPRINT_PDF_PRINT_COMMAND to a trusted PDF renderer.");entry=await SetPendingResultAsync(entry,"FAILED","Trusted PDF renderer is not configured; no submission was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report renderer configuration failure for job {entry.Id}: {ex.Message}");}return;}
         if(entry.Stage=="DOWNLOADED")entry=entry with{Stage="SUBMISSION_INTENT"};
         await AgentLocalSpool.SaveAsync(entry);
         try{await ReportAsync(api,entry.Id,entry.LeaseToken,"SUBMITTING",entry.SubmissionEventKey);}
         catch(Exception ex){Console.Error.WriteLine($"Job {entry.Id} is safely retained; submission was not attempted because the API did not acknowledge it: {ex.Message}");return;}
         entry=entry with{Stage="SUBMITTING"};await AgentLocalSpool.SaveAsync(entry);
+        Console.WriteLine($"Submitting job {entry.Id} to Windows spooler queue '{entry.QueueName}'.");
         string resultStatus,resultError="";
         try{
             var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id);
@@ -194,14 +202,14 @@ public static class Program {
             Console.WriteLine($"Connected to QR Print API as {device.GetProperty("name").GetString()} ({mode}). Printer queue: {queueName}");
             PrinterInfo? reported=null;
             if(mode=="REAL"){
-                reported=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.OrdinalIgnoreCase))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);
+                reported=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.Ordinal))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);
                 using var observed=await api.PostAsync("agent/heartbeat",new {observedQueue=ToObservedQueue(reported)});
                 if(!reported.Available)Console.Error.WriteLine($"UNAVAILABLE: assigned Windows queue '{queueName}' is not currently available. No print will be reported as successful.");
             } else {
                 using var simulatedHeartbeat=await api.PostAsync("agent/heartbeat",new {ping=true});
                 Console.WriteLine("SIMULATED ONLY: this agent will not inspect or access a Windows printer queue.");
             }
-            keepAlive=Task.Run(async()=>{while(!stop.IsCancellationRequested){try{if(mode=="REAL"){var current=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.OrdinalIgnoreCase))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);using var h=await api.PostAsync("agent/heartbeat",new {observedQueue=ToObservedQueue(current)},stop.Token);Console.WriteLine($"Heartbeat accepted; assigned queue status: {current.Status}.");}else{using var h=await api.PostAsync("agent/heartbeat",new {ping=true},stop.Token);Console.WriteLine("Simulated heartbeat accepted; no Windows printer queue was accessed.");}}catch(OperationCanceledException) when(stop.IsCancellationRequested){break;}catch(Exception ex){Console.Error.WriteLine($"API heartbeat failed: {ex.Message}");}try{await Task.Delay(TimeSpan.FromSeconds(15),stop.Token);}catch(OperationCanceledException){break;}}});
+            keepAlive=Task.Run(async()=>{while(!stop.IsCancellationRequested){try{if(mode=="REAL"){var current=(await adapter.DiscoverAsync()).FirstOrDefault(p=>p.Name.Equals(queueName,StringComparison.Ordinal))??new PrinterInfo(queueName,false,false,"QUEUE_NOT_INSTALLED",false);using var h=await api.PostAsync("agent/heartbeat",new {observedQueue=ToObservedQueue(current)},stop.Token);Console.WriteLine($"Heartbeat accepted; assigned queue status: {current.Status}.");}else{using var h=await api.PostAsync("agent/heartbeat",new {ping=true},stop.Token);Console.WriteLine("Simulated heartbeat accepted; no Windows printer queue was accessed.");}}catch(OperationCanceledException) when(stop.IsCancellationRequested){break;}catch(Exception ex){Console.Error.WriteLine($"API heartbeat failed: {ex.Message}");}try{await Task.Delay(TimeSpan.FromSeconds(15),stop.Token);}catch(OperationCanceledException){break;}}});
             while(true){
                 foreach(var localJob in await AgentLocalSpool.LoadAllAsync(shopId))await SyncSpoolEntryAsync(api,adapter,localJob);
                 JsonDocument claim;
@@ -209,16 +217,19 @@ public static class Program {
                 catch(Exception ex){Console.Error.WriteLine($"Job claim failed; reconnecting in five seconds: {ex.Message}");await Task.Delay(TimeSpan.FromSeconds(5));continue;}
                 using var claimDocument=claim;
                 var job=claimDocument.RootElement.GetProperty("job");
-                if(job.ValueKind==JsonValueKind.Null){await Task.Delay(TimeSpan.FromSeconds(3));continue;}
+                if(job.ValueKind==JsonValueKind.Null){var diagnostics=claimDocument.RootElement.TryGetProperty("diagnostics",out var details)?details:default;var reason=diagnostics.ValueKind==JsonValueKind.Object&&diagnostics.TryGetProperty("reasons",out var reasons)?reasons.ToString():"unavailable";var examples=diagnostics.ValueKind==JsonValueKind.Object&&diagnostics.TryGetProperty("examples",out var sample)?sample.ToString():"[]";Console.WriteLine($"No eligible queued job for agent printer '{queueName}' ({mode}); claim reasons: {reason}; examples: {examples}.");await Task.Delay(TimeSpan.FromSeconds(10));continue;}
                 var id=job.GetProperty("id").GetString()!;var token=job.GetProperty("leaseToken").GetString()!;
                 Console.WriteLine($"Claimed job {id} ({mode}); downloading fitted PDF.");
+                var deliveryStage="loading print options";
                 try {
                     using var options=await api.GetJobPrintOptionsAsync(id,token);
                     var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
+                    deliveryStage="downloading fitted PDF";
                     var bytes=await api.DownloadAsync(id,token);
+                    deliveryStage="saving encrypted local spool copy";
                     var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,bytes);System.Security.Cryptography.CryptographicOperations.ZeroMemory(bytes);
                     await SyncSpoolEntryAsync(api,adapter,local);
-                } catch(Exception ex){Console.Error.WriteLine($"Job {id} was not submitted; local download persistence or delivery failed: {ex.Message}");}
+                } catch(Exception ex){Console.Error.WriteLine($"Job {id} failed during {deliveryStage}; it was not submitted by this attempt: {ex.Message}");}
             }
         } finally {stop.Cancel();if(keepAlive is not null)try{await keepAlive;}catch{}}
     }

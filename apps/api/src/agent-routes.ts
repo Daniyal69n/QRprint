@@ -3,7 +3,7 @@ import type {PrismaClient,PrintJobStatus,PhysicalPrintStatus,Prisma} from '@pris
 import {randomUUID} from 'node:crypto';
 import {z} from 'zod';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
-import {hashSecret,canTransitionJob,canQueuePayment,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
+import {hashSecret,canTransitionJob,canQueuePayment,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
 import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl} from './private-storage.js';
 
@@ -42,11 +42,13 @@ export function createAgentRouter(db:PrismaClient){
       where:{printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],...(skipped.size?{id:{notIn:[...skipped]}}:{})},
       orderBy:{createdAt:'asc'},
       take:25,
-      select:{id:true,orderId:true},
+      select:{id:true,orderId:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true},
      });
      for(const candidate of candidates){
+      const reason=claimSkipReason(candidate,agent,now,maxAttempts);
+      if(reason){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason});continue;}
       const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
-      if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);continue;}
+      if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PAYMENT_NOT_ELIGIBLE',paymentStatus:payment?.status??'MISSING'});continue;}
       return candidate;
      }
      if(candidates.length<25)return undefined;
@@ -54,21 +56,66 @@ export function createAgentRouter(db:PrismaClient){
    },
    claimIfQueued:async(candidate:{id:string;orderId:string})=>{
     const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
-    if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);return undefined;}
+    if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PAYMENT_NOT_ELIGIBLE',paymentStatus:payment?.status??'MISSING'});return undefined;}
     token=`qpl_${randomUUID()}`;
     const updated=await db.printJob.updateMany({
      where:{id:candidate.id,printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}]},
      data:{status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
     });
-    if(!updated.count)skipped.add(candidate.id);
+    if(!updated.count){skipped.add(candidate.id);log('info','agent.job.claim.race_lost',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id});}
     return updated.count?candidate:undefined;
    },
   });
-  if(!claimed)return res.json({job:null,leaseSeconds});const job=await db.printJob.findUniqueOrThrow({where:{id:claimed.id},include:{order:{include:{document:true,payment:true}}}});log('info','agent.job.claimed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,attempt:job.attempt});res.json({job:{id:job.id,idempotencyKey:job.idempotencyKey,mode:job.mode,status:job.status,attempt:job.attempt,leaseToken:token,leaseExpiresAt:expires.toISOString(),order:{id:job.order.id,paperSize:job.order.paperSize,copies:job.order.copies,color:job.order.color,pageCount:job.order.document.pageCount,paymentStatus:job.order.payment?.status}},leaseSeconds});
+  if(!claimed){
+   const queued=await db.printJob.findMany({where:{status:'QUEUED',order:{shopId:agent.shopId}},take:101,orderBy:{createdAt:'asc'},select:{id:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,order:{select:{payment:{select:{status:true}}}}}});
+   const inspected=queued.slice(0,100);
+   const reasons:Record<string,number>={};
+   const examples:Array<{jobId:string;reason:string;paymentStatus?:string}>=[];
+   for(const job of inspected){
+    const reason=claimSkipReason(job,agent,now,maxAttempts)??(canQueuePayment(job.order.payment?.status)?'ELIGIBLE_NOT_CLAIMED':'PAYMENT_NOT_ELIGIBLE');
+    reasons[reason]=(reasons[reason]??0)+1;
+    if(examples.length<10)examples.push({jobId:job.id,reason,...(job.order.payment?.status?{paymentStatus:job.order.payment.status}:{})});
+   }
+   if(!queued.length)reasons.NO_QUEUED_JOBS=1;
+   const diagnostics={agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode,queueName:agent.queueName,queuedJobsInspected:inspected.length,inspectionTruncated:queued.length>inspected.length,reasons,examples};
+   log('warn','agent.job.claim.empty',diagnostics);
+   return res.json({job:null,leaseSeconds,diagnostics:{queueName:agent.queueName,mode:agent.mode,queuedJobsInspected:inspected.length,inspectionTruncated:queued.length>inspected.length,reasons,examples}});
+  }
+  const job=await db.printJob.findUniqueOrThrow({where:{id:claimed.id},include:{order:{include:{document:true,payment:true}}}});
+  log('info','agent.job.claimed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,attempt:job.attempt,paymentStatus:job.order.payment?.status});
+  res.json({job:{id:job.id,idempotencyKey:job.idempotencyKey,mode:job.mode,status:job.status,attempt:job.attempt,leaseToken:token,leaseExpiresAt:expires.toISOString(),order:{id:job.order.id,paperSize:job.order.paperSize,copies:job.order.copies,color:job.order.color,pageCount:job.order.document.pageCount,paymentStatus:job.order.payment?.status}},leaseSeconds});
  }catch(e){next(e);}});
  router.get('/jobs/:id/state',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,id=routeParam(req,"id");await reapExpired(db);const job=await db.printJob.findUnique({where:{id},select:{id:true,printerId:true,mode:true,status:true,physicalStatus:true,claimedById:true,leaseTokenHash:true,leaseExpiresAt:true,order:{select:{shopId:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');const supplied=String(req.headers['x-job-lease']||'');res.json({id:job.id,status:job.status,physicalStatus:job.physicalStatus,leaseExpiresAt:job.leaseExpiresAt?.toISOString()??null,leaseOwned:!!supplied&&leaseValid(job,agent.id,supplied),claimedByThisAgent:job.claimedById===agent.id});}catch(e){next(e);}});
  router.get('/jobs/:id/print-options',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,token=String(req.headers['x-job-lease']||'');const job=await db.printJob.findUnique({where:{id:routeParam(req,'id')},include:{order:{select:{shopId:true,doubleSided:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');if(!leaseValid(job,agent.id,token))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');res.setHeader('Cache-Control','private, no-store');res.json({doubleSided:job.order.doubleSided});}catch(e){next(e);}});
- router.get('/jobs/:id/document',async(req:AgentRequest,res,next)=>{try{const agent=req.agent!,token=String(req.headers['x-job-lease']||'');const job=await db.printJob.findUnique({where:{id:routeParam(req, "id")},include:{order:{include:{document:true}}}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');if(!leaseValid(job,agent.id,token))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');if(!['LEASED','DOWNLOADED'].includes(job.status))return fail(res,409,'JOB_NOT_DOWNLOADABLE','Job is not ready for download.');const doc=job.order.document;if(doc.deletedAt)return fail(res,410,'DOCUMENT_EXPIRED','The source document is no longer retained.');const fitted=await fitPdf(await readPrivatePdf(doc.storageKey),{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});if(job.status==='LEASED')await db.printJob.updateMany({where:{id:job.id,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token)},data:{status:'DOWNLOADED'}});res.setHeader('Cache-Control','private, no-store');res.setHeader('X-Print-Job-Id',job.id);res.setHeader('X-Page-Count',String(fitted.pageCount));const bytes=Buffer.from(fitted.pdf);if(usesPrivateBlob()){const key=`agent-jobs/${job.id}.pdf`;await writePrivatePdf(key,bytes,{overwrite:true});return res.json({downloadUrl:await createPrivateDownloadUrl(key),pageCount:fitted.pageCount,expiresInSeconds:300});}res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition',`attachment; filename="${job.id}.pdf"`);res.send(bytes);}catch(e){next(e);}});
+ router.get('/jobs/:id/document',async(req:AgentRequest,res,next)=>{
+  const agent=req.agent!,jobId=String(req.params.id);
+  try{
+   const token=String(req.headers['x-job-lease']||'');
+   const job=await db.printJob.findUnique({where:{id:routeParam(req,'id')},include:{order:{include:{document:true}}}});
+   if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode||job.order.shopId!==agent.shopId)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');
+   if(!leaseValid(job,agent.id,token))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');
+   if(!['LEASED','DOWNLOADED'].includes(job.status))return fail(res,409,'JOB_NOT_DOWNLOADABLE','Job is not ready for download.');
+   const doc=job.order.document;
+   if(doc.deletedAt)return fail(res,410,'DOCUMENT_EXPIRED','The source document is no longer retained.');
+   const fitted=await fitPdf(await readPrivatePdf(doc.storageKey),{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});
+   if(job.status==='LEASED')await db.printJob.updateMany({where:{id:job.id,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token)},data:{status:'DOWNLOADED'}});
+   res.setHeader('Cache-Control','private, no-store');
+   res.setHeader('X-Print-Job-Id',job.id);
+   res.setHeader('X-Page-Count',String(fitted.pageCount));
+   const bytes=Buffer.from(fitted.pdf);
+   if(usesPrivateBlob()){
+    const key=`agent-jobs/${job.id}.pdf`;
+    await writePrivatePdf(key,bytes,{overwrite:true});
+    return res.json({downloadUrl:await createPrivateDownloadUrl(key),pageCount:fitted.pageCount,expiresInSeconds:300});
+   }
+   res.setHeader('Content-Type','application/pdf');
+   res.setHeader('Content-Disposition',`attachment; filename="${job.id}.pdf"`);
+   res.send(bytes);
+  }catch(e){
+   log('error','agent.job.document.download_failed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId,errorType:e instanceof Error?e.name:'unknown'});
+   next(e);
+  }
+ });
  router.post('/jobs/:id/status',async(req:AgentRequest,res,next)=>{try{const b=z.object({eventKey:z.string().min(12).max(100),status:z.enum(['SUBMITTING','SPOOLER_ACCEPTED','SIMULATED_COMPLETE','FAILED','OUTCOME_UNKNOWN']),leaseToken:z.string().min(20),error:z.string().max(500).optional(),externalJobId:z.string().max(200).optional()}).parse(req.body);const agent=req.agent!;const job=await db.printJob.findUnique({where:{id:routeParam(req, "id")}});if(!job||job.printerId!==agent.printerId||job.mode!==agent.mode)return fail(res,404,'JOB_NOT_FOUND','Job is not assigned to this agent.');const prior=await db.agentEvent.findUnique({where:{jobId_eventKey:{jobId:routeParam(req, "id"),eventKey:b.eventKey}}});const duplicate=resolveAgentEvent(prior,agent.id,b.status);if(duplicate==='REPLAY')return res.json({ok:true,idempotentReplay:true,status:b.status});if(duplicate==='CONFLICT')return fail(res,409,'EVENT_KEY_CONFLICT','Event key was already used for a different update.');if(!leaseValid(job,agent.id,b.leaseToken))return fail(res,409,'LEASE_INVALID','Job lease is invalid or expired.');if(!canTransitionJob(job.status as AgentJobState,b.status as AgentJobState))return fail(res,409,'INVALID_JOB_TRANSITION',`Cannot transition ${job.status} to ${b.status}.`);if(b.status==='SPOOLER_ACCEPTED'&&job.mode!=='REAL')return fail(res,409,'MODE_MISMATCH','Simulated jobs cannot report spooler acceptance.');if(b.status==='SIMULATED_COMPLETE'&&job.mode!=='SIMULATED')return fail(res,409,'MODE_MISMATCH','Real jobs cannot report simulated completion.');if(b.status==='FAILED'&&job.status==='SUBMITTING')return fail(res,409,'OUTCOME_MUST_BE_UNKNOWN','After submission begins, interruptions must be reported as OUTCOME_UNKNOWN.');
   const physical:PhysicalPrintStatus=b.status==='SPOOLER_ACCEPTED'?'SPOOLER_ACCEPTED':b.status==='SIMULATED_COMPLETE'?'SIMULATED_ONLY':b.status==='OUTCOME_UNKNOWN'?'UNKNOWN':job.physicalStatus;
   const now=new Date(),terminal=['SPOOLER_ACCEPTED','SIMULATED_COMPLETE','FAILED','OUTCOME_UNKNOWN'].includes(b.status);await db.$transaction(async tx=>{await tx.agentEvent.create({data:{jobId:job.id,agentDeviceId:agent.id,eventKey:b.eventKey,eventType:b.status,payload:{error:b.error,externalJobId:b.externalJobId} as Prisma.InputJsonValue}});const changed=await tx.printJob.updateMany({where:{id:job.id,status:job.status,claimedById:agent.id,leaseTokenHash:hashSecret(b.leaseToken),leaseExpiresAt:{gt:now}},data:{status:b.status as PrintJobStatus,physicalStatus:physical,error:b.error??null,externalJobId:b.externalJobId??job.externalJobId,submissionStartedAt:b.status==='SUBMITTING'?now:job.submissionStartedAt,completedAt:terminal?now:undefined,...(terminal?{claimedById:null,leaseTokenHash:null,leaseExpiresAt:null}:{})}});if(!changed.count){const conflict=Object.assign(new Error('Job state changed before status update committed.'),{code:'AGENT_JOB_CONFLICT'});throw conflict;}});log('info','agent.job.status',{agentId:agent.id,shopId:agent.shopId,jobId:job.id,status:b.status,mode:job.mode});res.json({ok:true,status:b.status,physicalStatus:physical,physicalPrintConfirmed:false});
