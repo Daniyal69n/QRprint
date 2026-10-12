@@ -152,6 +152,8 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   shopIds.push(shop.id, otherShop.id);
   const printer = await db.printer.create({ data: { shopId: shop.id, name: `${tag} simulated printer`, queueName: `${tag}-queue`, status: 'UNKNOWN' } });
   printerIds.push(printer.id);
+  const stalePrinter = await db.printer.create({ data: { shopId: shop.id, name: `${tag} previous printer`, queueName: `${tag}-old-queue`, status: 'UNKNOWN' } });
+  printerIds.push(stalePrinter.id);
   await db.pricing.create({ data: { shopId: shop.id, paperSize: 'A4', color: true, pricePerPage: 5, colorSurcharge: 2.5, updatedAt: new Date() } });
 
   const pdf = await PDFDocument.create();
@@ -396,6 +398,10 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     const publicPaymentMethod=await call(`/shops/${shop.slug}/payment-method`);
     assert.equal(publicPaymentMethod.status,200);
     assert.deepEqual(await publicPaymentMethod.json(),{enabled:true,provider:'Test bank',accountName:'QR Print Test',accountNumber:'123456789',instructions:'Use the order number as the transfer note.'});
+    for(const token of agentTokens){
+      const refreshed=await call('/agent/heartbeat',{method:'POST',headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify({})});
+      assert.equal(refreshed.status,200,'an enrolled agent heartbeat refreshes the online window before checkout');
+    }
     const oneStepCheckout=await call('/orders',json({shopId:shop.id,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-claim-at-checkout`,manualTransferSent:true,transferReference:'TXN-CHECKOUT'}));
     assert.equal(oneStepCheckout.status,201);
     const claimedOrder=await oneStepCheckout.json() as {id:string;printJob:{id:string;status:string;printerId:string}|null};
@@ -404,8 +410,10 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     assert.equal(claimedOrder.printJob?.status,'QUEUED');
     assert.equal(claimedOrder.printJob?.printerId,printer.id);
     if(claimedOrder.printJob)jobIds.push(claimedOrder.printJob.id);
+    await db.printJob.update({where:{id:claimedOrder.printJob!.id},data:{printerId:stalePrinter.id}});
     const claimedCheckoutJob=await claimOne();
     assert.equal(claimedCheckoutJob.id,claimedOrder.printJob?.id,'agent claims the auto-queued customer-attested order');
+    assert.equal((await db.printJob.findUniqueOrThrow({where:{id:claimedOrder.printJob!.id}})).printerId,printer.id,'agent safely reassigns an orphaned same-shop printer ID during claim');
     const claimedPayment=await db.payment.findUniqueOrThrow({where:{orderId:claimedOrder.id}});
     paymentIds.push(claimedPayment.id);
     assert.equal(claimedPayment.status,'CUSTOMER_ATTESTED','checkout records that the customer claims to have sent payment; no owner verification is required');

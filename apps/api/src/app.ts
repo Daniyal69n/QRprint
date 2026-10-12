@@ -53,6 +53,14 @@ async function audit(actorId:string,action:string,targetType:string,targetId:str
 function error(res:Response,status:number,code:string,message:string){return res.status(status).json({error:{code,message}});}
 function printerSupportsDuplex(capabilities:Prisma.JsonValue|null):boolean{return !!capabilities&&typeof capabilities==='object'&&!Array.isArray(capabilities)&&capabilities.canDuplex===true;}
 async function findActiveDocument(id:string,ownerId:string){const document=await db.document.findFirst({where:{id,ownerId}});return document&&!document.deletedAt?document:null;}
+async function findReadyPrintAgent(shopId:string){
+  const agents=await db.agentDevice.findMany({
+    where:{shopId,mode:executionMode,printerId:{not:null},lastSeenAt:{gt:new Date(Date.now()-45_000)},user:{is:{isActive:true}}},
+    include:{printer:true},
+    orderBy:{lastSeenAt:'desc'},
+  });
+  return agents.find(agent=>agent.printer&&agent.printer.shopId===shopId&&!agent.printer.status.startsWith('UNAVAILABLE'));
+}
 app.use(helmet());app.use(cors(createCorsPolicy()));app.use(express.json({limit:'1mb'}));app.use(rateLimit({windowMs:60_000,limit:120}) as never);
 app.use((req,_res,next)=>{if(process.env.VERCEL==='1'&&(req.url==='/api'||req.url.startsWith('/api/')))req.url=req.url.slice(4)||'/';next();});
 const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:25*1024*1024},fileFilter:(_req,file,cb)=>file.mimetype==='application/pdf'?cb(null,true):cb(new Error('Only PDF files are accepted'))});
@@ -156,9 +164,7 @@ app.post('/orders',authenticate,async(req:AuthRequest,res,next)=>{try{
   const price=shop.pricing.find(x=>x.paperSize===b.paperSize&&x.color===b.color);
   if(!price)return error(res,400,'PRICE_NOT_CONFIGURED','Shop has not configured that option.');
   const total=calculatePrice(doc.pageCount??1,b.copies,Number(price.pricePerPage),b.color,Number(price.colorSurcharge));
-  const autoPrintAgent=b.manualTransferSent
-    ?(await db.agentDevice.findMany({where:{shopId:shop.id,mode:executionMode,printerId:{not:null}},include:{printer:true},orderBy:{lastSeenAt:'desc'}})).find(agent=>agent.printer&&!agent.printer.status.startsWith('UNAVAILABLE'))
-    :undefined;
+  const autoPrintAgent=b.manualTransferSent?await findReadyPrintAgent(shop.id):undefined;
   if(b.manualTransferSent&&!autoPrintAgent?.printer)return error(res,409,'SHOP_PRINTER_NOT_READY','This shop has no registered printer agent ready to receive orders. Contact the shop before sending payment.');
   const order=await db.$transaction(async tx=>{
     const created=await tx.order.create({data:{shopId:b.shopId,documentId:b.documentId,copies:b.copies,paperSize:b.paperSize,color:b.color,doubleSided:b.doubleSided,idempotencyKey:b.idempotencyKey,customerId:req.user!.id,total}});
@@ -172,7 +178,7 @@ app.post('/orders',authenticate,async(req:AuthRequest,res,next)=>{try{
   await audit(req.user!.id,'ORDER_CREATED','Order',order.order.id,{total:String(total),manualTransferClaimed:b.manualTransferSent});
   if(order.job){
     await audit(req.user!.id,'PRINT_JOB_QUEUED','PrintJob',order.job.id,{mode:order.job.mode,printerId:order.job.printerId,customerAttestedPayment:true});
-    log('info','print.job.queued',{jobId:order.job.id,orderId:order.order.id,shopId:shop.id,printerId:order.job.printerId,mode:order.job.mode,customerAttestedPayment:true});
+    log('info','print.job.queued',{jobId:order.job.id,orderId:order.order.id,shopId:shop.id,agentId:autoPrintAgent?.id,printerId:order.job.printerId,queueName:autoPrintAgent?.printer?.queueName,mode:order.job.mode,customerAttestedPayment:true});
   }
   res.status(201).json({...order.order,printJob:order.job?{id:order.job.id,status:order.job.status,printerId:order.job.printerId}:null});
 }catch(e){next(e);}});
@@ -231,7 +237,7 @@ app.post('/payments/:id/submit',authenticate,requireRole('CUSTOMER'),async(req:A
   if(payment.provider!=='manual-transfer')return error(res,409,'MANUAL_PAYMENT_NOT_ALLOWED','This payment does not use manual transfer.');
   if(payment.status==='CUSTOMER_ATTESTED')return res.json({submitted:true,idempotentReplay:true,status:payment.status});
   if(payment.status!=='PENDING')return error(res,409,'PAYMENT_NOT_SUBMITTABLE','This payment is no longer awaiting transfer confirmation.');
-  const agent=(await db.agentDevice.findMany({where:{shopId:payment.order.shopId,mode:executionMode,printerId:{not:null}},include:{printer:true},orderBy:{lastSeenAt:'desc'}})).find(device=>device.printer&&!device.printer.status.startsWith('UNAVAILABLE'));
+  const agent=await findReadyPrintAgent(payment.order.shopId);
   if(!agent?.printer)return error(res,409,'SHOP_PRINTER_NOT_READY','This shop has no registered printer agent ready to receive orders. Contact the shop before sending payment.');
   const result=await db.$transaction(async tx=>{
     const updated=await tx.payment.update({where:{id:payment.id},data:{status:'CUSTOMER_ATTESTED',customerReference:b.reference||null}});
@@ -240,7 +246,7 @@ app.post('/payments/:id/submit',authenticate,requireRole('CUSTOMER'),async(req:A
   });
   await audit(req.user!.id,'CUSTOMER_PAYMENT_ATTESTED','Payment',payment.id,{hasCustomerReference:!!b.reference,printJobId:result.job.id});
   await audit(req.user!.id,'PRINT_JOB_QUEUED','PrintJob',result.job.id,{mode:result.job.mode,printerId:result.job.printerId,customerAttestedPayment:true});
-  log('info','print.job.queued',{jobId:result.job.id,orderId:payment.orderId,shopId:payment.order.shopId,printerId:result.job.printerId,mode:result.job.mode,customerAttestedPayment:true});
+  log('info','print.job.queued',{jobId:result.job.id,orderId:payment.orderId,shopId:payment.order.shopId,agentId:agent.id,printerId:result.job.printerId,queueName:agent.printer?.queueName,mode:result.job.mode,customerAttestedPayment:true});
   res.json({submitted:true,payment:result.payment,job:{id:result.job.id,status:result.job.status},message:'Transfer marked as sent and the print job is queued. The payment is not independently verified.'});
 }catch(e){next(e);}});
 app.get('/shops/:slug/print-options',async(req,res,next)=>{try{const shop=await db.shop.findUnique({where:{slug:routeParam(req,'slug')},include:{owner:{select:{isActive:true}},printers:{select:{capabilities:true}}}});if(!shop||!shop.isActive||!shop.owner.isActive)return error(res,404,'SHOP_NOT_FOUND','Shop not found.');res.json({supportsDuplex:shop.supportsDuplex&&shop.printers.some(printer=>printerSupportsDuplex(printer.capabilities))});}catch(e){next(e);}});

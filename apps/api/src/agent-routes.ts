@@ -35,17 +35,21 @@ export function createAgentRouter(db:PrismaClient){
   const agent=req.agent!,now=new Date(),expires=new Date(now.getTime()+leaseSeconds*1000);
   let token='';
   const skipped=new Set<string>();
+  const connectedDevices=await db.agentDevice.findMany({where:{shopId:agent.shopId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{printerId:true}});
+  const connectedPrinterIds=new Set(connectedDevices.flatMap(device=>device.printerId?[device.printerId]:[]));
+  const canAdoptPrinter=(printerId:string|null,printerShopId:string|undefined)=>printerId===null||(printerShopId===agent.shopId&&!connectedPrinterIds.has(printerId));
   const claimed=await atomicClaimNext({
    candidate:async()=>{
     while(true){
      const candidates=await db.printJob.findMany({
-      where:{printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],...(skipped.size?{id:{notIn:[...skipped]}}:{})},
+      where:{status:'QUEUED',order:{shopId:agent.shopId},...(skipped.size?{id:{notIn:[...skipped]}}:{})},
       orderBy:{createdAt:'asc'},
       take:25,
-      select:{id:true,orderId:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true},
+      select:{id:true,orderId:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,printer:{select:{shopId:true}}},
      });
      for(const candidate of candidates){
-      const reason=claimSkipReason(candidate,agent,now,maxAttempts);
+      const reassignPrinter=candidate.printerId!==agent.printerId&&canAdoptPrinter(candidate.printerId,candidate.printer?.shopId);
+      const reason=candidate.claimedById&&candidate.leaseExpiresAt&&candidate.leaseExpiresAt>now?'ACTIVE_LEASE':claimSkipReason(candidate,agent,now,maxAttempts,reassignPrinter);
       if(reason){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason});continue;}
       const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
       if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PAYMENT_NOT_ELIGIBLE',paymentStatus:payment?.status??'MISSING'});continue;}
@@ -54,32 +58,42 @@ export function createAgentRouter(db:PrismaClient){
      if(candidates.length<25)return undefined;
     }
    },
-   claimIfQueued:async(candidate:{id:string;orderId:string})=>{
+   claimIfQueued:async(candidate:{id:string;orderId:string;printerId:string|null;printer:{shopId:string}|null})=>{
+    if(candidate.printerId!==agent.printerId&&candidate.printerId!==null){
+     const oldPrinterStillConnected=await db.agentDevice.findFirst({where:{shopId:agent.shopId,printerId:candidate.printerId,lastSeenAt:{gt:new Date(now.getTime()-45_000)},user:{is:{isActive:true}}},select:{id:true}});
+     if(candidate.printer?.shopId!==agent.shopId||oldPrinterStillConnected){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PRINTER_MISMATCH'});return undefined;}
+    }
     const payment=await db.payment.findUnique({where:{orderId:candidate.orderId},select:{status:true}});
     if(!canQueuePayment(payment?.status)){skipped.add(candidate.id);log('warn','agent.job.claim.skipped',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id,reason:'PAYMENT_NOT_ELIGIBLE',paymentStatus:payment?.status??'MISSING'});return undefined;}
     token=`qpl_${randomUUID()}`;
     const updated=await db.printJob.updateMany({
-     where:{id:candidate.id,printerId:agent.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}]},
-     data:{status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
+     where:{id:candidate.id,printerId:candidate.printerId,mode:agent.mode,status:'QUEUED',attempt:{lt:maxAttempts},OR:[{nextAttemptAt:null},{nextAttemptAt:{lte:now}}],order:{shopId:agent.shopId}},
+     data:{printerId:agent.printerId,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token),leaseExpiresAt:expires,attempt:{increment:1},error:null},
     });
     if(!updated.count){skipped.add(candidate.id);log('info','agent.job.claim.race_lost',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:candidate.id});}
     return updated.count?candidate:undefined;
    },
   });
   if(!claimed){
-   const queued=await db.printJob.findMany({where:{status:'QUEUED',order:{shopId:agent.shopId}},take:101,orderBy:{createdAt:'asc'},select:{id:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,order:{select:{payment:{select:{status:true}}}}}});
+   const [allJobs,queuedCount]=await Promise.all([
+    db.printJob.count({where:{order:{shopId:agent.shopId}}}),
+    db.printJob.count({where:{status:'QUEUED',order:{shopId:agent.shopId}}}),
+   ]);
+   const queued=await db.printJob.findMany({where:{status:'QUEUED',order:{shopId:agent.shopId}},take:101,orderBy:{createdAt:'asc'},select:{id:true,printerId:true,mode:true,attempt:true,maxAttempts:true,nextAttemptAt:true,claimedById:true,leaseExpiresAt:true,printer:{select:{shopId:true}},order:{select:{payment:{select:{status:true}}}}}});
    const inspected=queued.slice(0,100);
-   const reasons:Record<string,number>={};
+   const reasons:Record<string,number>={status:Math.max(0,allJobs-queuedCount),lease:0,printer:0,mode:0,payment:0,attempt:0,retry:0,eligible:0};
    const examples:Array<{jobId:string;reason:string;paymentStatus?:string}>=[];
    for(const job of inspected){
-    const reason=claimSkipReason(job,agent,now,maxAttempts)??(canQueuePayment(job.order.payment?.status)?'ELIGIBLE_NOT_CLAIMED':'PAYMENT_NOT_ELIGIBLE');
-    reasons[reason]=(reasons[reason]??0)+1;
+    const reassignPrinter=job.printerId!==agent.printerId&&canAdoptPrinter(job.printerId,job.printer?.shopId);
+    const reason=job.claimedById&&job.leaseExpiresAt&&job.leaseExpiresAt>now?'ACTIVE_LEASE':claimSkipReason(job,agent,now,maxAttempts,reassignPrinter)??(canQueuePayment(job.order.payment?.status)?'ELIGIBLE':'PAYMENT_NOT_ELIGIBLE');
+    const reasonKey=reason==='ACTIVE_LEASE'?'lease':reason==='PRINTER_MISMATCH'?'printer':reason==='MODE_MISMATCH'?'mode':reason==='PAYMENT_NOT_ELIGIBLE'?'payment':reason==='ATTEMPT_LIMIT'?'attempt':reason==='RETRY_SCHEDULED'?'retry':'eligible';
+    reasons[reasonKey]=(reasons[reasonKey]??0)+1;
     if(examples.length<10)examples.push({jobId:job.id,reason,...(job.order.payment?.status?{paymentStatus:job.order.payment.status}:{})});
    }
-   if(!queued.length)reasons.NO_QUEUED_JOBS=1;
-   const diagnostics={agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode,queueName:agent.queueName,queuedJobsInspected:inspected.length,inspectionTruncated:queued.length>inspected.length,reasons,examples};
+   if(!queuedCount)reasons.NO_QUEUED_JOBS=1;
+   const diagnostics={agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,mode:agent.mode,queueName:agent.queueName,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,reasons,examples};
    log('warn','agent.job.claim.empty',diagnostics);
-   return res.json({job:null,leaseSeconds,diagnostics:{queueName:agent.queueName,mode:agent.mode,queuedJobsInspected:inspected.length,inspectionTruncated:queued.length>inspected.length,reasons,examples}});
+   return res.json({job:null,leaseSeconds,diagnostics:{queueName:agent.queueName,mode:agent.mode,totalJobsForShop:allJobs,queuedJobsForShop:queuedCount,queuedJobsInspected:inspected.length,inspectionTruncated:queuedCount>inspected.length,reasons,examples}});
   }
   const job=await db.printJob.findUniqueOrThrow({where:{id:claimed.id},include:{order:{include:{document:true,payment:true}}}});
   log('info','agent.job.claimed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,attempt:job.attempt,paymentStatus:job.order.payment?.status});

@@ -11,8 +11,8 @@ export function verifySecret(secret:string,storedHash:string){const aa=Buffer.fr
 export const canAgentUseShop=(agentShopId:string,resourceShopId:string)=>agentShopId===resourceShopId;
 export const canQueuePayment=(status:string|undefined|null)=>status==='VERIFIED'||status==='CASH_AUTHORIZED'||status==='CUSTOMER_ATTESTED';
 export type ClaimSkipReason='PRINTER_MISMATCH'|'MODE_MISMATCH'|'ATTEMPT_LIMIT'|'RETRY_SCHEDULED'|'PAYMENT_NOT_ELIGIBLE';
-export function claimSkipReason(job:{printerId:string|null;mode:string;attempt:number;maxAttempts:number;nextAttemptAt:Date|null},agent:{printerId:string;mode:string},now:Date,configuredMaxAttempts:number):Exclude<ClaimSkipReason,'PAYMENT_NOT_ELIGIBLE'>|null{
-  if(job.printerId!==agent.printerId)return 'PRINTER_MISMATCH';
+export function claimSkipReason(job:{printerId:string|null;mode:string;attempt:number;maxAttempts:number;nextAttemptAt:Date|null},agent:{printerId:string;mode:string},now:Date,configuredMaxAttempts:number,canReassignPrinter=false):Exclude<ClaimSkipReason,'PAYMENT_NOT_ELIGIBLE'>|null{
+  if(job.printerId!==null&&job.printerId!==agent.printerId&&!canReassignPrinter)return 'PRINTER_MISMATCH';
   if(job.mode!==agent.mode)return 'MODE_MISMATCH';
   if(job.attempt>=Math.min(job.maxAttempts,configuredMaxAttempts))return 'ATTEMPT_LIMIT';
   if(job.nextAttemptAt&&job.nextAttemptAt>now)return 'RETRY_SCHEDULED';
