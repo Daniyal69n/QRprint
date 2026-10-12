@@ -5,8 +5,7 @@
       "root": "apps/api",
       "framework": "express",
       "entrypoint": "index.mjs",
-      "buildCommand": "npm run build:vercel",
-      "maxDuration": 60
+      "buildCommand": "npm run build:vercel"
     },
     "web": {
       "root": "apps/web",
