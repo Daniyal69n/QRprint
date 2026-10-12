@@ -69,13 +69,18 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         }
         var renderer = ResolvePdfRenderer();
         if (!string.IsNullOrWhiteSpace(renderer)) {
-            // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
-            // command line must support QRPRINT_PDF_PRINT_ARGS placeholders {printer}, {file}, and {duplex}.
-            var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" -silent \"{file}\"";
-            if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
-            var duplex = doubleSided ? "duplexlong" : "simplex";
-            var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
-            Console.WriteLine($"Print command: {Path.GetFileName(renderer)} to queue '{queueName}' (duplex={duplex}).");
+            var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS");
+            string args;
+            if (!string.IsNullOrWhiteSpace(template)) {
+                if (doubleSided && !template.Contains("{duplex}", StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
+                var duplex = doubleSided ? "duplexlong" : "simplex";
+                args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
+            } else {
+                args = doubleSided
+                    ? $"-print-to \"{queueName}\" -print-settings \"duplexlong\" -silent \"{pdfPath}\""
+                    : $"-print-to \"{queueName}\" -silent \"{pdfPath}\"";
+            }
+            Console.WriteLine($"Print command: {Path.GetFileName(renderer)} to queue '{queueName}' (args: {args}).");
             using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
             if (process is null) return new(false,"FAILED",queueName,"PDF renderer did not start.");
             using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
