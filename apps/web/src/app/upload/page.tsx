@@ -5,23 +5,27 @@ import {apiUrl} from '../../lib/api-url';
 
 type Price={id:string;paperSize:PaperSize;color:boolean;pricePerPage:number;colorSurcharge:number};
 type Shop={id:string;name:string;pricing:Price[]};
-type ManualPayment={paymentId:string;orderId:string;provider:string;accountName:string;accountNumber:string;instructions:string|null;amount:string;submitted:boolean};
+type ShopPaymentMethod={enabled:boolean;provider:string|null;accountName:string|null;accountNumber:string|null;instructions:string|null};
 
 export default function Upload(){
   const [token,setToken]=useState('');
   const [slug,setSlug]=useState(''),[shop,setShop]=useState<Shop|null>(null),[paper,setPaper]=useState<PaperSize>('A4'),[color,setColor]=useState(false),[copies,setCopies]=useState(1);
   const [file,setFile]=useState<File|null>(null),[documentId,setDocumentId]=useState(''),[pageCount,setPageCount]=useState(0),[previewUrl,setPreviewUrl]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
-  const [manualPayment,setManualPayment]=useState<ManualPayment|null>(null),[transferReference,setTransferReference]=useState('');
+  const [paymentMethod,setPaymentMethod]=useState<ShopPaymentMethod|null>(null),[transferMarked,setTransferMarked]=useState(false),[transferReference,setTransferReference]=useState(''),[submittedOrder,setSubmittedOrder]=useState('');
   const [duplexAvailable,setDuplexAvailable]=useState(false),[doubleSided,setDoubleSided]=useState(false);
 
   useEffect(()=>{
     const initialSlug=new URLSearchParams(window.location.search).get('shop')||'';
     const savedToken=sessionStorage.getItem('qrprint_guest_token')||'';
     setSlug(initialSlug);setToken(savedToken);
-    if(initialSlug)void fetch(apiUrl(`/shops/${encodeURIComponent(initialSlug)}`)).then(async response=>{
-      const data=await response.json();
-      if(!response.ok)throw new Error(data.error?.message||'Shop is unavailable.');
-      setShop(data);setMessage(`Loaded prices for ${data.name}.`);
+    if(initialSlug)void Promise.all([
+      fetch(apiUrl(`/shops/${encodeURIComponent(initialSlug)}`)),
+      fetch(apiUrl(`/shops/${encodeURIComponent(initialSlug)}/payment-method`)),
+    ]).then(async([shopResponse,paymentResponse])=>{
+      const [data,payment]=await Promise.all([shopResponse.json(),paymentResponse.json()]);
+      if(!shopResponse.ok)throw new Error(data.error?.message||'Shop is unavailable.');
+      if(!paymentResponse.ok)throw new Error(payment.error?.message||'Could not load this shop’s payment details.');
+      setShop(data);setPaymentMethod(payment);setMessage(`Loaded prices and payment details for ${data.name}.`);
     }).catch(error=>setMessage((error as Error).message));
   },[]);
 
@@ -57,9 +61,9 @@ export default function Upload(){
   async function lookup(){
     setBusy(true);setMessage('');
     try{
-      const data=await request(`/shops/${encodeURIComponent(slug)}`);
-      setShop(data);setMessage(`Prices loaded for ${data.name}.`);
-    }catch(error){setShop(null);setMessage((error as Error).message);}
+      const [data,payment]=await Promise.all([request(`/shops/${encodeURIComponent(slug)}`),request(`/shops/${encodeURIComponent(slug)}/payment-method`)]);
+      setShop(data);setPaymentMethod(payment);setTransferMarked(false);setSubmittedOrder('');setMessage(`Prices and payment details loaded for ${data.name}.`);
+    }catch(error){setShop(null);setPaymentMethod(null);setMessage((error as Error).message);}
     finally{setBusy(false);}
   }
 
@@ -99,16 +103,17 @@ export default function Upload(){
 
   async function placeOrder(){
     if(!shop||!documentId||!token)return;
+    if(paymentMethod?.enabled&&!transferMarked){setMessage('First make the transfer using the displayed shop details, then click “I have sent the transfer” before placing your order.');return;}
     setBusy(true);setMessage('');let createdId='';
     try{
-      const order=await request('/orders',{method:'POST',body:JSON.stringify({shopId:shop.id,documentId,copies,paperSize:paper,color,idempotencyKey:crypto.randomUUID()})});
+      const order=await request('/orders',{method:'POST',body:JSON.stringify({shopId:shop.id,documentId,copies,paperSize:paper,color,doubleSided,idempotencyKey:crypto.randomUUID(),manualTransferSent:paymentMethod?.enabled===true&&transferMarked,transferReference})});
       createdId=order.id;
-      await request(`/orders/${order.id}/print-options`,{method:'PUT',body:JSON.stringify({doubleSided})});
-      const payment=await request(`/orders/${order.id}/pay`,{method:'POST',body:JSON.stringify({})});
-      if(payment.manualPayment){
-        setManualPayment({paymentId:payment.id,orderId:order.id,...payment.manualPayment,amount:String(payment.amount),submitted:payment.status==='SUBMITTED'});
-        setMessage(`Order ${order.id} created. Transfer Rs ${payment.amount} using the details below, then mark it as sent. Printing waits for shop confirmation.`);
+      if(paymentMethod?.enabled&&transferMarked){
+        setSubmittedOrder(order.id);setTransferMarked(false);
+        setMessage(`Order ${order.id} placed. Your transfer claim is now with the shop owner for verification. Printing starts after the owner verifies it.`);
       }else{
+        const payment=await request(`/orders/${order.id}/pay`,{method:'POST',body:JSON.stringify({})});
+        if(payment.manualPayment)throw new Error('Mark your transfer as sent before placing this order.');
         const verified=await request(`/payments/${payment.id}/verify`,{method:'POST',body:JSON.stringify({})});
         setMessage(`Order ${order.id} recorded. Payment: ${verified.payment.status} via ${payment.provider}.`);
       }
@@ -116,22 +121,10 @@ export default function Upload(){
     finally{setBusy(false);}
   }
 
-  async function submitTransfer(){
-    if(!manualPayment)return;
-    setBusy(true);setMessage('');
-    try{
-      await request(`/payments/${manualPayment.paymentId}/submit`,{method:'POST',body:JSON.stringify({reference:transferReference})});
-      setManualPayment(current=>current?{...current,submitted:true}:current);
-      setMessage('Transfer marked as sent. The shop must confirm receipt before printing.');
-    }catch(error){setMessage((error as Error).message);}
-    finally{setBusy(false);}
-  }
-
   return <main className="wrap">
     <div className="eyebrow">Customer flow</div><h1>Prepare your print order</h1>
     <p className="muted">No customer account is needed. Scan the shop QR, upload your PDF, choose print options, and review the price.</p>
     {shop&&duplexAvailable&&<section className="card" style={{maxWidth:720,marginBottom:16}}><h2>Print sides</h2><label><input type="checkbox" checked={doubleSided} onChange={event=>setDoubleSided(event.target.checked)}/> Print on both sides of each sheet</label></section>}
-    {manualPayment&&<section className="card" style={{maxWidth:720,marginBottom:16}}><h2>Manual transfer for order {manualPayment.orderId}</h2><p>Amount: <strong>Rs {manualPayment.amount}</strong></p><p>Method: {manualPayment.provider}</p><p>Account name: <strong>{manualPayment.accountName}</strong></p><p>Account number: <strong><code>{manualPayment.accountNumber}</code></strong></p>{manualPayment.instructions&&<p>{manualPayment.instructions}</p>}{manualPayment.submitted?<p role="status">Transfer submitted for shop confirmation. Do not pay again.</p>:<div className="form"><label>Transfer reference (optional)<input value={transferReference} onChange={event=>setTransferReference(event.target.value)} maxLength={120}/></label><button className="btn" disabled={busy} onClick={()=>void submitTransfer()}>I have sent the transfer</button></div>}</section>}
     <section className="card" style={{maxWidth:720,marginBottom:16}}>
       <h2>1. Choose a print shop</h2>
       <div className="form"><label>Shop QR code / slug<input value={slug} onChange={event=>setSlug(event.target.value)} placeholder="Scan a shop QR or enter its slug"/></label><button className="btn" onClick={lookup} disabled={busy||!slug}>Load shop prices</button></div>
@@ -139,14 +132,16 @@ export default function Upload(){
     </section>
     <section className="card" style={{maxWidth:720,marginBottom:16}}>
       <h2>2. Upload & fit</h2>
-      <div className="form"><label>PDF document<input type="file" accept="application/pdf,.pdf" onChange={event=>{setFile(event.target.files?.[0]||null);setDocumentId('');setPageCount(0);setPreviewUrl('');}}/></label><button className="btn" onClick={uploadPdf} disabled={busy||!file||!shop}>Upload PDF</button></div>
+      <div className="form"><label>PDF document<input type="file" accept="application/pdf,.pdf" onChange={event=>{setFile(event.target.files?.[0]||null);setDocumentId('');setPageCount(0);setPreviewUrl('');setTransferMarked(false);setSubmittedOrder('');}}/></label><button className="btn" onClick={uploadPdf} disabled={busy||!file||!shop}>Upload PDF</button></div>
       {pageCount>0&&<><p>{pageCount} pages detected. Each output page scales to fit and is centered on the selected paper.</p>{previewUrl&&<iframe title="Fitted document preview" src={previewUrl} style={{width:'100%',height:520,border:'1px solid #cbd7de',borderRadius:8}}/>}</>}
     </section>
     {shop&&<section className="card" style={{maxWidth:720}}>
       <h2>3. Copies, paper & price</h2>
-      <div className="form"><label>Paper<select value={paper} onChange={async event=>{const size=event.target.value as PaperSize;setPaper(size);if(documentId&&token){setBusy(true);try{await loadPreview(documentId,size);}catch(error){setMessage((error as Error).message);}finally{setBusy(false);}}}}><option value="A4">A4</option><option value="A3">A3</option><option value="LETTER">US Letter</option></select></label><label>Copies<input type="number" min="1" max="100" value={copies} onChange={event=>setCopies(Math.max(1,Number(event.target.value)))}/></label><label><input type="checkbox" checked={color} onChange={event=>setColor(event.target.checked)}/> Color</label></div>
+      <div className="form"><label>Paper<select value={paper} onChange={async event=>{const size=event.target.value as PaperSize;setPaper(size);setTransferMarked(false);if(documentId&&token){setBusy(true);try{await loadPreview(documentId,size);}catch(error){setMessage((error as Error).message);}finally{setBusy(false);}}}}><option value="A4">A4</option><option value="A3">A3</option><option value="LETTER">US Letter</option></select></label><label>Copies<input type="number" min="1" max="100" value={copies} onChange={event=>{setCopies(Math.max(1,Number(event.target.value)));setTransferMarked(false);}}/></label><label><input type="checkbox" checked={color} onChange={event=>{setColor(event.target.checked);setTransferMarked(false);}}/> Color</label></div>
       {price?<p>Price per page: Rs {price.pricePerPage}{color&&price.colorSurcharge?` + Rs ${price.colorSurcharge} color surcharge`:''}{estimate!==null&&<strong> · Estimate: Rs {estimate}</strong>}</p>:<p className="muted">This shop has not configured that paper/color combination.</p>}
-      <button className="btn" onClick={placeOrder} disabled={busy||!token||!documentId||!price}>Place order</button>
+      {paymentMethod?.enabled&&estimate!==null&&<section className="card" style={{margin:'12px 0'}}><h3>Pay this shop before placing your order</h3><p>Amount: <strong>Rs {estimate}</strong></p><p>Method: {paymentMethod.provider}</p><p>Account name: <strong>{paymentMethod.accountName}</strong></p><p>Account number: <strong><code>{paymentMethod.accountNumber}</code></strong></p>{paymentMethod.instructions&&<p>{paymentMethod.instructions}</p>}{submittedOrder?<p role="status">Order {submittedOrder} was submitted. The owner must verify the transfer before printing.</p>:<div className="form"><label>Transfer reference (optional)<input value={transferReference} onChange={event=>setTransferReference(event.target.value)} maxLength={120}/></label><button type="button" className="btn" disabled={busy||transferMarked} onClick={()=>{setTransferMarked(true);setMessage('Transfer marked as sent. Now place your order to notify the shop owner.');}}>{transferMarked?'Transfer marked as sent':'I have sent the transfer'}</button></div>}</section>}
+      {paymentMethod?.enabled===false&&process.env.NODE_ENV==='production'&&<p className="muted">This shop has not enabled a payment method, so orders cannot be placed yet.</p>}
+      <button className="btn" onClick={placeOrder} disabled={busy||!token||!documentId||!price||submittedOrder!==''||(process.env.NODE_ENV==='production'&&!paymentMethod?.enabled)||(paymentMethod?.enabled&&!transferMarked)}>Place order</button>
     </section>}
     {message&&<p role="status" className="banner">{message}</p>}
     <p className="muted">PDF bytes are not stored in MongoDB. In Production they are temporarily held in private Blob storage until the shop’s Windows Agent downloads the paid print job; the local agent spool is encrypted. Manual transfers require shop-owner confirmation before queueing.</p>
