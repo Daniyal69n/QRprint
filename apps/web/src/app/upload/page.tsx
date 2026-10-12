@@ -6,6 +6,19 @@ import {apiUrl} from '../../lib/api-url';
 type Price={id:string;paperSize:PaperSize;color:boolean;pricePerPage:number;colorSurcharge:number};
 type Shop={id:string;name:string;pricing:Price[]};
 type ShopPaymentMethod={enabled:boolean;provider:string|null;accountName:string|null;accountNumber:string|null;instructions:string|null};
+class ApiRequestError extends Error{
+  constructor(message:string,readonly status:number){super(message);this.name='ApiRequestError';}
+}
+
+function isExpiredToken(token:string){
+  try{
+    const payload=token.split('.')[1];
+    if(!payload)return true;
+    const base64=payload.replace(/-/g,'+').replace(/_/g,'/');
+    const claims=JSON.parse(atob(base64.padEnd(Math.ceil(base64.length/4)*4,'='))) as {exp?:unknown};
+    return typeof claims.exp!=='number'||claims.exp<=Date.now()/1000;
+  }catch{return true;}
+}
 
 export default function Upload(){
   const [token,setToken]=useState('');
@@ -46,12 +59,20 @@ export default function Upload(){
   async function request(url:string,init:RequestInit={},authToken=token){
     const response=await fetch(apiUrl(url),{...init,headers:{...(init.body instanceof FormData?{}:{'Content-Type':'application/json'}),...(authToken?{Authorization:`Bearer ${authToken}`}:{ }),...init.headers}});
     const data=await response.json();
-    if(!response.ok)throw new Error(data.error?.message||data.error||`Request failed (${response.status})`);
+    if(!response.ok)throw new ApiRequestError(data.error?.message||data.error||`Request failed (${response.status})`,response.status);
     return data;
   }
 
-  async function ensureGuestSession(){
-    if(token)return token;
+  function clearUploadedDocument(){
+    setDocumentId('');setPageCount(0);
+    setPreviewUrl(old=>{if(old)URL.revokeObjectURL(old);return '';});
+  }
+
+  async function ensureGuestSession(forceNew=false){
+    if(token&&!forceNew&&!isExpiredToken(token))return token;
+    if(forceNew||token){
+      sessionStorage.removeItem('qrprint_guest_token');setToken('');clearUploadedDocument();
+    }
     const session=await request('/auth/guest',{method:'POST',body:JSON.stringify({})},'');
     if(session.role!=='CUSTOMER'||!session.token)throw new Error('Could not start a secure guest order session.');
     sessionStorage.setItem('qrprint_guest_token',session.token);setToken(session.token);
@@ -72,7 +93,7 @@ export default function Upload(){
     if(!response.ok){
       let message='Could not render the fitted PDF preview.';
       try{const data=await response.json();message=data.error?.message||data.error||message;}catch{}
-      throw new Error(message);
+      throw new ApiRequestError(message,response.status);
     }
     const blob=await response.blob();
     setPreviewUrl(old=>{if(old)URL.revokeObjectURL(old);return URL.createObjectURL(blob);});
@@ -82,21 +103,29 @@ export default function Upload(){
     if(!file||!shop)return;
     setBusy(true);setMessage('');
     try{
-      const authToken=await ensureGuestSession();
-      let data:{id:string;pageCount:number};
-      if(process.env.NEXT_PUBLIC_API_URL==='/api'){
-        if(file.size>25*1024*1024)throw new Error('PDF exceeds the 25 MiB limit.');
-        const target=await request('/documents/upload-url',{method:'POST',body:JSON.stringify({})},authToken);
-        const uploaded=await fetch(target.uploadUrl,{method:'PUT',headers:{'Content-Type':'application/pdf'},body:file});
-        if(!uploaded.ok)throw new Error('Private PDF upload failed; no document was registered.');
-        data=await request('/documents/complete',{method:'POST',body:JSON.stringify({id:target.id,storageKey:target.storageKey})},authToken);
-      }else{
-        const form=new FormData();form.append('file',file);
-        data=await request('/documents',{method:'POST',body:form},authToken);
+      for(let attempt=0;attempt<2;attempt++){
+        const authToken=await ensureGuestSession(attempt>0);
+        try{
+          let data:{id:string;pageCount:number};
+          if(process.env.NEXT_PUBLIC_API_URL==='/api'){
+            if(file.size>25*1024*1024)throw new Error('PDF exceeds the 25 MiB limit.');
+            const target=await request('/documents/upload-url',{method:'POST',body:JSON.stringify({})},authToken);
+            const uploaded=await fetch(target.uploadUrl,{method:'PUT',headers:{'Content-Type':'application/pdf'},body:file});
+            if(!uploaded.ok)throw new Error('Private PDF upload failed; no document was registered.');
+            data=await request('/documents/complete',{method:'POST',body:JSON.stringify({id:target.id,storageKey:target.storageKey})},authToken);
+          }else{
+            const form=new FormData();form.append('file',file);
+            data=await request('/documents',{method:'POST',body:form},authToken);
+          }
+          setDocumentId(data.id);setPageCount(data.pageCount);
+          await loadPreview(data.id,paper,authToken);
+          setMessage(`PDF ready: ${data.pageCount} page(s). The fitted preview is shown below.`);
+          return;
+        }catch(error){
+          if(attempt===0&&error instanceof ApiRequestError&&error.status===401)continue;
+          throw error;
+        }
       }
-      setDocumentId(data.id);setPageCount(data.pageCount);
-      await loadPreview(data.id,paper,authToken);
-      setMessage(`PDF ready: ${data.pageCount} page(s). The fitted preview is shown below.`);
     }catch(error){setMessage((error as Error).message);}
     finally{setBusy(false);}
   }
@@ -117,7 +146,12 @@ export default function Upload(){
         const verified=await request(`/payments/${payment.id}/verify`,{method:'POST',body:JSON.stringify({})});
         setMessage(`Order ${order.id} recorded. Payment: ${verified.payment.status} via ${payment.provider}.`);
       }
-    }catch(error){setMessage(`${createdId?`Order ${createdId} was created. `:''}${(error as Error).message}`);}
+    }catch(error){
+      if(error instanceof ApiRequestError&&error.status===401){
+        sessionStorage.removeItem('qrprint_guest_token');setToken('');clearUploadedDocument();
+        setMessage('Your secure upload session expired. Please upload the PDF again before placing the order.');
+      }else setMessage(`${createdId?`Order ${createdId} was created. `:''}${(error as Error).message}`);
+    }
     finally{setBusy(false);}
   }
 
