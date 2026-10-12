@@ -53,6 +53,7 @@ public sealed class AgentApiClient : IDisposable {
         using var request=new HttpRequestMessage(HttpMethod.Get,$"agent/jobs/{Uri.EscapeDataString(jobId)}/document");
         request.Headers.Add("X-Job-Lease",leaseToken);
         request.Headers.Accept.ParseAdd("application/pdf");
+        request.Headers.Accept.ParseAdd("application/vnd.openxmlformats-officedocument.wordprocessingml.document");
         request.Headers.Accept.ParseAdd("application/json");
         using var timeout=CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(DocumentTimeout);
@@ -63,9 +64,18 @@ public sealed class AgentApiClient : IDisposable {
         byte[] bytes;
         string source;
         string? storageHost=null;
+        string documentType="pdf";
+        if(response.Headers.TryGetValues("X-Document-Type",out var docTypeHeaders)){
+            var val=docTypeHeaders.FirstOrDefault();
+            if(!string.IsNullOrEmpty(val))documentType=val.Trim().ToLowerInvariant();
+        }
         if(contentType.Equals("application/json",StringComparison.OrdinalIgnoreCase)){
             using var payload=JsonDocument.Parse(await response.Content.ReadAsStringAsync(timeout.Token));
             var rawUrl=payload.RootElement.GetProperty("downloadUrl").GetString()??throw new InvalidOperationException("API did not return a document URL.");
+            if(payload.RootElement.TryGetProperty("documentType",out var dtEl)&&dtEl.ValueKind==JsonValueKind.String){
+                var dtVal=dtEl.GetString();
+                if(!string.IsNullOrEmpty(dtVal))documentType=dtVal.Trim().ToLowerInvariant();
+            }
             var uri=new Uri(rawUrl);
             storageHost=AgentDocument.DescribeOrigin(rawUrl);
             if(uri.Scheme!="https")throw new InvalidOperationException("Private document URL must use HTTPS.");
@@ -79,10 +89,17 @@ public sealed class AgentApiClient : IDisposable {
             contentType=download.Content.Headers.ContentType?.MediaType??contentType;
         } else {
             bytes=await response.Content.ReadAsByteArrayAsync(timeout.Token);
-            source="inline-pdf";
+            source=documentType=="docx"?"inline-docx":"inline-pdf";
         }
-        if(!AgentDocument.HasPdfMagic(bytes))throw new InvalidOperationException($"Fitted document from {source} is not a PDF ({bytes.Length} bytes, content-type {contentType}).");
-        return new DocumentDownloadResult(bytes,status,contentType,source,bytes.Length,storageHost,started.ElapsedMilliseconds);
+        if(contentType.Contains("wordprocessingml",StringComparison.OrdinalIgnoreCase)||contentType.Contains("docx",StringComparison.OrdinalIgnoreCase)){
+            documentType="docx";
+        }
+        if(documentType=="docx"){
+            if(!AgentDocument.HasDocxMagic(bytes))throw new InvalidOperationException($"Document from {source} is not a valid DOCX ({bytes.Length} bytes, content-type {contentType}).");
+        } else {
+            if(!AgentDocument.HasPdfMagic(bytes))throw new InvalidOperationException($"Fitted document from {source} is not a PDF ({bytes.Length} bytes, content-type {contentType}).");
+        }
+        return new DocumentDownloadResult(bytes,status,contentType,source,bytes.Length,storageHost,started.ElapsedMilliseconds,documentType);
     }
 
     public async Task<JsonDocument> PostStatusAsync(string jobId,object body,CancellationToken ct=default) {

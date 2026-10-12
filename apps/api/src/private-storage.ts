@@ -4,7 +4,7 @@ import {del,get,issueSignedToken,list,presignUrl,put} from '@vercel/blob';
 
 export const MAX_DOCUMENT_BYTES=25*1024*1024;
 export const MAX_FUNCTION_PDF_RESPONSE_BYTES=4*1024*1024;
-const keyPattern=/^(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.pdf$/;
+const keyPattern=/^(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+\.(pdf|docx)$/;
 
 export function usesPrivateBlob(env:NodeJS.ProcessEnv=process.env):boolean{return env.QRPRINT_STORAGE_PROVIDER==='vercel-blob';}
 export async function checkPrivateBlob():Promise<void>{await list({limit:1});}
@@ -19,10 +19,11 @@ export function privateStoragePath(storageKey:string,root=privateStorageRoot()):
   return file;
 }
 
+export function documentMimeType(storageKey:string):string{return storageKey.endsWith('.docx')?'application/vnd.openxmlformats-officedocument.wordprocessingml.document':'application/pdf';}
 export async function writePrivatePdf(storageKey:string,bytes:Buffer,options:{overwrite?:boolean}={}):Promise<void> {
   if(!keyPattern.test(storageKey))throw new Error('Invalid private document storage key.');
   if(usesPrivateBlob()){
-    await put(storageKey,bytes,{access:'private',contentType:'application/pdf',allowOverwrite:options.overwrite??false,addRandomSuffix:false,cacheControlMaxAge:60});
+    await put(storageKey,bytes,{access:'private',contentType:documentMimeType(storageKey),allowOverwrite:options.overwrite??false,addRandomSuffix:false,cacheControlMaxAge:60});
     return;
   }
   const file=privateStoragePath(storageKey),root=path.dirname(file);
@@ -49,9 +50,10 @@ export async function removePrivatePdf(storageKey:string):Promise<void> {
 export async function createPrivateUploadUrl(storageKey:string,validForMs=10*60*1000):Promise<{url:string;validUntil:number}> {
   if(!usesPrivateBlob())throw new Error('Direct uploads are available only when private Blob storage is configured.');
   if(!keyPattern.test(storageKey))throw new Error('Invalid private document storage key.');
+  const contentType=documentMimeType(storageKey);
   const validUntil=Date.now()+Math.max(60_000,Math.min(validForMs,60*60*1000));
-  const token=await issueSignedToken({pathname:storageKey,operations:['put'],allowedContentTypes:['application/pdf'],maximumSizeInBytes:MAX_DOCUMENT_BYTES,validUntil});
-  const {presignedUrl}=await presignUrl(token,{access:'private',pathname:storageKey,operation:'put',validUntil,allowedContentTypes:['application/pdf'],maximumSizeInBytes:MAX_DOCUMENT_BYTES,addRandomSuffix:false});
+  const token=await issueSignedToken({pathname:storageKey,operations:['put'],allowedContentTypes:[contentType],maximumSizeInBytes:MAX_DOCUMENT_BYTES,validUntil});
+  const {presignedUrl}=await presignUrl(token,{access:'private',pathname:storageKey,operation:'put',validUntil,allowedContentTypes:[contentType],maximumSizeInBytes:MAX_DOCUMENT_BYTES,addRandomSuffix:false});
   return {url:presignedUrl,validUntil};
 }
 
@@ -63,7 +65,8 @@ export async function createPrivateDownloadUrl(storageKey:string,validForMs=5*60
   return (await presignUrl(token,{access:'private',pathname:storageKey,operation:'get',validUntil})).presignedUrl;
 }
 
-export function privateDocumentKey(ownerId:string,id:string):string {
+export function privateDocumentKey(ownerId:string,id:string,ext:'pdf'|'docx'='pdf'):string {
   if(!/^[A-Za-z0-9_-]{1,100}$/.test(ownerId)||!/^[A-Za-z0-9_-]{1,100}$/.test(id))throw new Error('Invalid private document identity.');
-  return `documents/${ownerId}/${id}.pdf`;
+  return `documents/${ownerId}/${id}.${ext}`;
 }
+export function isDocxKey(storageKey:string):boolean{return storageKey.endsWith('.docx');}

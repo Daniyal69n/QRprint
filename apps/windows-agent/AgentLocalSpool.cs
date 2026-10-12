@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace QRPrint.Agent;
 
-public sealed record LocalPrintJob(string Id,string LeaseToken,string Mode,string QueueName,string Stage,string SubmissionEventKey,string ShopId,bool DoubleSided=false,string? ResultEventKey=null,string? ResultStatus=null,string? ResultError=null);
+public sealed record LocalPrintJob(string Id,string LeaseToken,string Mode,string QueueName,string Stage,string SubmissionEventKey,string ShopId,bool DoubleSided=false,string? ResultEventKey=null,string? ResultStatus=null,string? ResultError=null,string FileExtension="pdf");
 
 /// <summary>Per-user durable spool. Metadata (including lease tokens) is protected with current-user DPAPI.</summary>
 public static class AgentLocalSpool {
@@ -17,16 +17,18 @@ public static class AgentLocalSpool {
     }
     private static string EncryptedDocumentPath(string shopId,string id)=>Path.Combine(JobDirectory(shopId,id),"document.dpapi");
     public static string DocumentPath(string shopId,string id)=>EncryptedDocumentPath(shopId,id);
-    public static async Task<LocalPrintJob> SaveDownloadedAsync(string shopId,string id,string leaseToken,string mode,string queueName,bool doubleSided,byte[] pdf) {
+    public static async Task<LocalPrintJob> SaveDownloadedAsync(string shopId,string id,string leaseToken,string mode,string queueName,bool doubleSided,byte[] documentBytes,string fileExtension="pdf") {
         if(!OperatingSystem.IsWindows())throw new PlatformNotSupportedException("Durable agent spool metadata uses Windows DPAPI.");
         var directory=JobDirectory(shopId,id);Directory.CreateDirectory(directory);
         var document=EncryptedDocumentPath(shopId,id);
         if(!File.Exists(document)){
-            byte[] protectedPdf;
-            try{protectedPdf=AgentLocalSettings.ProtectLocalData(pdf);}finally{CryptographicOperations.ZeroMemory(pdf);}
-            try{await AtomicWriteAsync(document,protectedPdf);}finally{CryptographicOperations.ZeroMemory(protectedPdf);}
+            byte[] protectedDoc;
+            try{protectedDoc=AgentLocalSettings.ProtectLocalData(documentBytes);}finally{CryptographicOperations.ZeroMemory(documentBytes);}
+            try{await AtomicWriteAsync(document,protectedDoc);}finally{CryptographicOperations.ZeroMemory(protectedDoc);}
         }
-        var entry=new LocalPrintJob(id,leaseToken,mode,queueName,"DOWNLOADED",$"submit-{Guid.NewGuid():N}",shopId,doubleSided);
+        var ext=string.IsNullOrWhiteSpace(fileExtension)?"pdf":fileExtension.Trim('.').ToLowerInvariant();
+        if(ext!="pdf"&&ext!="docx")ext="pdf";
+        var entry=new LocalPrintJob(id,leaseToken,mode,queueName,"DOWNLOADED",$"submit-{Guid.NewGuid():N}",shopId,doubleSided,FileExtension:ext);
         await SaveAsync(entry);return entry;
     }
     public static async Task SaveAsync(LocalPrintJob entry) {
@@ -42,13 +44,13 @@ public static class AgentLocalSpool {
         foreach(var file in Directory.EnumerateFiles(shopRoot,"job.dpapi",SearchOption.AllDirectories)){
             try{
                 var encrypted=await File.ReadAllBytesAsync(file);var clear=AgentLocalSettings.UnprotectLocalData(encrypted);
-                try{var entry=JsonSerializer.Deserialize<LocalPrintJob>(clear);if(entry is not null&&entry.ShopId==shopId&&File.Exists(EncryptedDocumentPath(entry.ShopId,entry.Id))){result.Add(entry);foreach(var stale in Directory.EnumerateFiles(JobDirectory(entry.ShopId,entry.Id),"submit-*.pdf"))try{File.Delete(stale);}catch{}}}
+                try{var entry=JsonSerializer.Deserialize<LocalPrintJob>(clear);if(entry is not null&&entry.ShopId==shopId&&File.Exists(EncryptedDocumentPath(entry.ShopId,entry.Id))){result.Add(entry);foreach(var stale in Directory.EnumerateFiles(JobDirectory(entry.ShopId,entry.Id),"submit-*.*"))try{File.Delete(stale);}catch{}}}
                 finally{CryptographicOperations.ZeroMemory(clear);}
             }catch(Exception ex) when(ex is CryptographicException or JsonException or IOException or InvalidOperationException){Console.Error.WriteLine("A local job spool record could not be read; it has been retained for manual recovery.");}
         }
         return result;
     }
-    public static async Task<string> CreateSubmissionCopyAsync(string shopId,string id){var encrypted=await File.ReadAllBytesAsync(DocumentPath(shopId,id));var clear=AgentLocalSettings.UnprotectLocalData(encrypted);var path=Path.Combine(JobDirectory(shopId,id),$"submit-{Guid.NewGuid():N}.pdf");try{await File.WriteAllBytesAsync(path,clear);return path;}finally{CryptographicOperations.ZeroMemory(clear);}}
+    public static async Task<string> CreateSubmissionCopyAsync(string shopId,string id,string fileExtension="pdf"){var encrypted=await File.ReadAllBytesAsync(DocumentPath(shopId,id));var clear=AgentLocalSettings.UnprotectLocalData(encrypted);var ext=string.IsNullOrWhiteSpace(fileExtension)?"pdf":fileExtension.Trim('.').ToLowerInvariant();if(ext!="pdf"&&ext!="docx")ext="pdf";var path=Path.Combine(JobDirectory(shopId,id),$"submit-{Guid.NewGuid():N}.{ext}");try{await File.WriteAllBytesAsync(path,clear);return path;}finally{CryptographicOperations.ZeroMemory(clear);}}
     public static Task DeleteSubmissionCopyAsync(string shopId,string id,string path)=>Task.Run(()=>{var full=Path.GetFullPath(path);var jobRoot=Path.GetFullPath(JobDirectory(shopId,id))+Path.DirectorySeparatorChar;if(!full.StartsWith(jobRoot,StringComparison.OrdinalIgnoreCase)||!Path.GetFileName(full).StartsWith("submit-",StringComparison.OrdinalIgnoreCase))throw new InvalidOperationException("Refusing to delete a file outside this job's temporary spool files.");if(File.Exists(full))File.Delete(full);});
     public static Task DeleteAsync(string shopId,string id)=>Task.Run(()=>{var directory=JobDirectory(shopId,id);if(Directory.Exists(directory))Directory.Delete(directory,true);});
     private static async Task AtomicWriteAsync(string destination,byte[] data) {

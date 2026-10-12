@@ -62,7 +62,11 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         if (doubleSided && !settings.CanDuplex) return new(false,"FAILED",queueName,"The selected Windows driver does not report double-sided printing support.");
         var probe=ReadQueueStatus(queueName);
         if (!probe.Available) return new(false,"UNAVAILABLE",queueName,$"Windows spooler reports the queue unavailable ({probe.Status}).");
-        if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"PDF file does not exist");
+        if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"File does not exist");
+        var isDocx = pdfPath.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+        if (isDocx) {
+            return await SubmitViaPrintToAsync(queueName, pdfPath, doubleSided);
+        }
         var renderer = ResolvePdfRenderer();
         if (!string.IsNullOrWhiteSpace(renderer)) {
             // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
@@ -102,7 +106,8 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
     }
 
     private static async Task<PrintResult> SubmitViaPrintToAsync(string queueName, string pdfPath, bool doubleSided) {
-        if (doubleSided) return new(false,"FAILED",queueName,"Double-sided printing needs a PDF renderer (install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND). Windows PrintTo cannot set duplex.");
+        var isDocx = pdfPath.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
+        if (doubleSided && !isDocx) return new(false,"FAILED",queueName,"Double-sided printing needs a PDF renderer (install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND). Windows PrintTo cannot set duplex.");
         var info = new ProcessStartInfo {
             FileName = pdfPath,
             Verb = "PrintTo",
@@ -113,12 +118,12 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
             ErrorDialog = false,
         };
         if (!info.Verbs.Any(verb => verb.Equals("printto", StringComparison.OrdinalIgnoreCase)))
-            return new(false,"UNAVAILABLE",queueName,"This PC has no PrintTo handler for PDF files. Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND.");
-        Console.WriteLine($"Print command: Windows PrintTo verb to queue '{queueName}'.");
+            return new(false,"UNAVAILABLE",queueName,isDocx ? "This PC has no PrintTo handler for DOCX files (Microsoft Word is required)." : "This PC has no PrintTo handler for PDF files. Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND.");
+        Console.WriteLine($"Print command: Windows PrintTo verb to queue '{queueName}' ({pdfPath}).");
         using var process = Process.Start(info);
         if (process is null) {
             Console.WriteLine("Spooler submission handed to PrintTo handler (no process handle).");
-            return new(true,"SPOOLER_ACCEPTED",queueName,"Windows handed the PDF to the PrintTo handler. Physical output remains unconfirmed.");
+            return new(true,"SPOOLER_ACCEPTED",queueName,"Windows handed the document to the PrintTo handler. Physical output remains unconfirmed.");
         }
         using var timeout=new CancellationTokenSource(TimeSpan.FromMinutes(2));
         try { await process.WaitForExitAsync(timeout.Token); }
@@ -214,9 +219,15 @@ public static class Program {
         Console.WriteLine($"Preparing job {entry.Id} for exact printer queue '{entry.QueueName}'.");
         var available=(await adapter.DiscoverAsync()).Any(p=>p.Name.Equals(entry.QueueName,StringComparison.Ordinal)&&p.Available);
         if(entry.Mode=="REAL"&&!available){Console.Error.WriteLine($"Job {entry.Id} was not submitted: exact assigned queue '{entry.QueueName}' is missing or unavailable.");entry=await SetPendingResultAsync(entry,"FAILED","Assigned Windows queue is unavailable before submission; no print was attempted.");try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report queue-unavailable status for job {entry.Id}: {ex.Message}");}return;}
-        var renderer=WindowsQueueAdapter.ResolvePdfRenderer();
-        var printTo=new ProcessStartInfo{FileName="job.pdf",UseShellExecute=true}.Verbs.Any(verb=>verb.Equals("printto",StringComparison.OrdinalIgnoreCase));
-        if(entry.Mode=="REAL"&&string.IsNullOrWhiteSpace(renderer)&&(entry.DoubleSided||!printTo)){var detail=entry.DoubleSided?"Double-sided printing needs SumatraPDF or QRPRINT_PDF_PRINT_COMMAND.":"Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND; this PC has no PDF PrintTo handler.";Console.Error.WriteLine($"Job {entry.Id} was not submitted: {detail}");entry=await SetPendingResultAsync(entry,"FAILED",detail);try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report renderer configuration failure for job {entry.Id}: {ex.Message}");}return;}
+        var isDocx=entry.FileExtension.Equals("docx",StringComparison.OrdinalIgnoreCase);
+        if(isDocx){
+            var docxPrintTo=new ProcessStartInfo{FileName="job.docx",UseShellExecute=true}.Verbs.Any(verb=>verb.Equals("printto",StringComparison.OrdinalIgnoreCase));
+            if(entry.Mode=="REAL"&&!docxPrintTo){var detail="This PC has no PrintTo handler for DOCX files (Microsoft Word is required for direct printing).";Console.Error.WriteLine($"Job {entry.Id} was not submitted: {detail}");entry=await SetPendingResultAsync(entry,"FAILED",detail);try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report DOCX configuration failure for job {entry.Id}: {ex.Message}");}return;}
+        } else {
+            var renderer=WindowsQueueAdapter.ResolvePdfRenderer();
+            var printTo=new ProcessStartInfo{FileName="job.pdf",UseShellExecute=true}.Verbs.Any(verb=>verb.Equals("printto",StringComparison.OrdinalIgnoreCase));
+            if(entry.Mode=="REAL"&&string.IsNullOrWhiteSpace(renderer)&&(entry.DoubleSided||!printTo)){var detail=entry.DoubleSided?"Double-sided printing needs SumatraPDF or QRPRINT_PDF_PRINT_COMMAND.":"Install SumatraPDF or set QRPRINT_PDF_PRINT_COMMAND; this PC has no PDF PrintTo handler.";Console.Error.WriteLine($"Job {entry.Id} was not submitted: {detail}");entry=await SetPendingResultAsync(entry,"FAILED",detail);try{await ReportAsync(api,entry.Id,entry.LeaseToken,entry.ResultStatus!,entry.ResultEventKey!,entry.ResultError);entry=entry with{Stage="RESULT_REPORTED"};await AgentLocalSpool.SaveAsync(entry);}catch(Exception ex){Console.Error.WriteLine($"Could not report renderer configuration failure for job {entry.Id}: {ex.Message}");}return;}
+        }
         if(entry.Stage=="DOWNLOADED")entry=entry with{Stage="SUBMISSION_INTENT"};
         await AgentLocalSpool.SaveAsync(entry);
         try{await ReportAsync(api,entry.Id,entry.LeaseToken,"SUBMITTING",entry.SubmissionEventKey);}
@@ -225,7 +236,7 @@ public static class Program {
         Console.WriteLine($"Submitting job {entry.Id} to Windows spooler queue '{entry.QueueName}'.");
         string resultStatus,resultError="";
         try{
-            var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id);
+            var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id,entry.FileExtension);
             PrintResult result;
             try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy,entry.DoubleSided); }
             finally { await AgentLocalSpool.DeleteSubmissionCopyAsync(entry.ShopId,entry.Id,submissionCopy); }
@@ -246,15 +257,20 @@ public static class Program {
             using var options=await api.GetJobPrintOptionsAsync(id,token);
             var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
             Console.WriteLine($"Job {id}: print-options completed; duplex={doubleSided}.");
-            deliveryStage="downloading fitted PDF";
-            Console.WriteLine($"Job {id}: download started (GET agent/jobs/{{id}}/document, X-Job-Lease present, timeout {AgentDocument.DocumentTimeoutSeconds}s).");
+            deliveryStage="downloading document";
+            Console.WriteLine($"Job {id}: download started (GET agent/jobs/{id}/document, X-Job-Lease present, timeout {AgentDocument.DocumentTimeoutSeconds}s).");
             var downloaded=await api.DownloadAsync(id,token);
-            Console.WriteLine($"Job {id}: download completed; http={downloaded.StatusCode}; contentType={downloaded.ContentType}; source={downloaded.Source}; bytes={downloaded.ByteCount}; origin={downloaded.StorageHost??"api"}; elapsedMs={downloaded.ElapsedMs}.");
-            deliveryStage="validating local PDF";
-            if(!AgentDocument.HasPdfMagic(downloaded.Bytes))throw new InvalidOperationException("Fitted document failed PDF magic validation.");
-            Console.WriteLine($"Job {id}: local PDF validation passed.");
+            Console.WriteLine($"Job {id}: download completed; type={downloaded.DocumentType}; http={downloaded.StatusCode}; contentType={downloaded.ContentType}; source={downloaded.Source}; bytes={downloaded.ByteCount}; origin={downloaded.StorageHost??"api"}; elapsedMs={downloaded.ElapsedMs}.");
+            deliveryStage="validating local document";
+            if(downloaded.DocumentType=="docx"){
+                if(!AgentDocument.HasDocxMagic(downloaded.Bytes))throw new InvalidOperationException("Downloaded document failed DOCX magic validation.");
+                Console.WriteLine($"Job {id}: local DOCX validation passed.");
+            } else {
+                if(!AgentDocument.HasPdfMagic(downloaded.Bytes))throw new InvalidOperationException("Downloaded document failed PDF magic validation.");
+                Console.WriteLine($"Job {id}: local PDF validation passed.");
+            }
             deliveryStage="saving encrypted local spool copy";
-            var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,downloaded.Bytes);
+            var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,downloaded.Bytes,downloaded.DocumentType);
             System.Security.Cryptography.CryptographicOperations.ZeroMemory(downloaded.Bytes);
             Console.WriteLine($"Job {id}: encrypted spool saved.");
             deliveryStage="submitting to printer";
@@ -262,7 +278,7 @@ public static class Program {
         } catch(Exception ex) {
             var canceled=ex is OperationCanceledException or TaskCanceledException;
             Console.Error.WriteLine($"Job {id} failed during {deliveryStage}; {ex.GetType().Name}: {ex.Message}");
-            if(canceled)Console.Error.WriteLine($"Job {id}: request canceled while waiting for fitted PDF headers or body. No print was submitted.");
+            if(canceled)Console.Error.WriteLine($"Job {id}: request canceled while waiting for document headers or body. No print was submitted.");
             var reported=await TryReportPreSubmissionFailureAsync(api,id,token,deliveryStage,ex);
             if(!reported)await WaitForLeaseReleaseAsync(api,id,token);
         }

@@ -5,7 +5,7 @@ import {z} from 'zod';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
 import {hashSecret,canTransitionJob,canQueuePayment,canAdoptQueuedJob,claimCasWhere,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
-import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl} from './private-storage.js';
+import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl,isDocxKey,documentMimeType} from './private-storage.js';
 import {describeDocumentDelivery,fittedBlobKey} from './agent-document.js';
 
 const leaseSeconds=Math.max(15,Math.min(300,Number(process.env.AGENT_LEASE_SECONDS)||60));
@@ -126,23 +126,29 @@ export function createAgentRouter(db:PrismaClient){
    const doc=job.order.document;
    if(doc.deletedAt)return fail(res,410,'DOCUMENT_EXPIRED','The source document is no longer retained.');
    const sourceKey=doc.storageKey;
-   const fitted=await fitPdf(await readPrivatePdf(sourceKey),{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});
+   const isDocx=isDocxKey(sourceKey);
+   const rawBytes=await readPrivatePdf(sourceKey);
+   let bytes:Buffer;let pageCount:number;
+   if(isDocx){bytes=rawBytes;pageCount=doc.pageCount??0;}
+   else{const fitted=await fitPdf(rawBytes,{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});bytes=Buffer.from(fitted.pdf);pageCount=fitted.pageCount;}
    if(job.status==='LEASED')await db.printJob.updateMany({where:{id:job.id,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token)},data:{status:'DOWNLOADED'}});
    res.setHeader('Cache-Control','private, no-store');
    res.setHeader('X-Print-Job-Id',job.id);
-   res.setHeader('X-Page-Count',String(fitted.pageCount));
-   const bytes=Buffer.from(fitted.pdf);
+   res.setHeader('X-Page-Count',String(pageCount));
+   res.setHeader('X-Document-Type',isDocx?'docx':'pdf');
+   const mimeType=documentMimeType(sourceKey);
+   const ext=isDocx?'docx':'pdf';
    const delivery=describeDocumentDelivery(usesPrivateBlob());
    if(usesPrivateBlob()){
-    const key=fittedBlobKey(job.id);
+    const key=isDocx?`fitted/${job.id}.docx`:fittedBlobKey(job.id);
     await writePrivatePdf(key,bytes,{overwrite:true});
     const downloadUrl=await createPrivateDownloadUrl(key);
-    log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount:fitted.pageCount,contentType:delivery.contentType,storage:delivery.storage,fittedKey:key,sourceStored:true,durationMs:Date.now()-started});
-    return res.json({downloadUrl,pageCount:fitted.pageCount,expiresInSeconds:300});
+    log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount,contentType:mimeType,storage:delivery.storage,fittedKey:key,sourceStored:true,durationMs:Date.now()-started});
+    return res.json({downloadUrl,pageCount,expiresInSeconds:300,documentType:isDocx?'docx':'pdf'});
    }
-   log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount:fitted.pageCount,contentType:delivery.contentType,storage:delivery.storage,durationMs:Date.now()-started});
-   res.setHeader('Content-Type','application/pdf');
-   res.setHeader('Content-Disposition',`attachment; filename="${job.id}.pdf"`);
+   log('info','agent.job.document.ready',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId:job.id,bytes:bytes.length,pageCount,contentType:mimeType,storage:delivery.storage,durationMs:Date.now()-started});
+   res.setHeader('Content-Type',mimeType);
+   res.setHeader('Content-Disposition',`attachment; filename="${job.id}.${ext}"`);
    res.send(bytes);
   }catch(e){
    log('error','agent.job.document.download_failed',{agentId:agent.id,shopId:agent.shopId,printerId:agent.printerId,jobId,errorType:e instanceof Error?e.name:'unknown',durationMs:Date.now()-started});
