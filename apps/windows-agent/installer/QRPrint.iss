@@ -24,6 +24,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "{#PublishDir}\QRPrint.Agent.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PublishDir}\SumatraPDF.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\QR Print Agent"; Filename: "{app}\QRPrint.Agent.exe"

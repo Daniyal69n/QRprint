@@ -67,7 +67,7 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         if (!string.IsNullOrWhiteSpace(renderer)) {
             // Renderer integration is intentionally delegated to an installed PDF tool. The tool's
             // command line must support QRPRINT_PDF_PRINT_ARGS placeholders {printer}, {file}, and {duplex}.
-            var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" \"{file}\"";
+            var template = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_ARGS") ?? "-print-to \"{printer}\" -print-settings \"{duplex}\" -silent \"{file}\"";
             if (!template.Contains("{duplex}",StringComparison.Ordinal)) return new(false,"FAILED",queueName,"Configure QRPRINT_PDF_PRINT_ARGS with a {duplex} placeholder so the requested single/double-sided mode is applied.");
             var duplex = doubleSided ? "duplexlong" : "simplex";
             var args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
@@ -93,6 +93,8 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         var configured = Environment.GetEnvironmentVariable("QRPRINT_PDF_PRINT_COMMAND");
         if (!string.IsNullOrWhiteSpace(configured) && File.Exists(configured)) return configured;
         string[] known = [
+            Path.Combine(AppContext.BaseDirectory, "SumatraPDF.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SumatraPDF", "SumatraPDF.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SumatraPDF", "SumatraPDF.exe"),
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "SumatraPDF", "SumatraPDF.exe"),
         ];
