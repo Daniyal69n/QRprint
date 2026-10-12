@@ -79,6 +79,11 @@ model Shop {
   slug      String        @unique
   isActive  Boolean       @default(true)
   supportsDuplex Boolean  @default(false)
+  manualPaymentEnabled Boolean @default(false)
+  manualPaymentProvider String?
+  manualPaymentAccountName String?
+  manualPaymentAccountNumber String?
+  manualPaymentInstructions String?
   createdAt DateTime      @default(now())
   owner     User          @relation(fields: [ownerId], references: [id])
   printers  Printer[]

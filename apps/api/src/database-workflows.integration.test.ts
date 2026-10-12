@@ -372,7 +372,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
 
   const customerHistory=await call('/customer/orders',{headers:{authorization:customerAuth}});
   assert.equal(customerHistory.status,200);
-  const customerOrders=await customerHistory.json() as Array<{id:string;doubleSided:boolean;payment:{status:string}|null;printJob:{status:string;physicalStatus:string}|null}>;
+  const customerOrders=await customerHistory.json() as Array<{id:string;doubleSided:boolean;payment:{status:string;manualPayment:{accountName:string}|null}|null;printJob:{status:string;physicalStatus:string}|null}>;
   assert.deepEqual(new Set(customerOrders.map(o=>o.id)),new Set(orderIds),'customers see only their own orders');
   assert.equal(customerOrders.find(o=>o.id===order.id)?.payment?.status,'VERIFIED');
   assert.equal(customerOrders.find(o=>o.id===order.id)?.doubleSided,true);
@@ -383,10 +383,15 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
   assert.equal(metricData.developmentOnly,true);
   assert.equal(metricData.commissionBasisPoints,0);
   assert.equal(metricData.estimatedCommission,'0.00');
-  const priorManualSetting=await db.platformSetting.findUnique({where:{id:'platform'}});
   try{
-    assert.equal((await call('/admin/manual-payment-settings',{headers:{authorization:ownerAuth}})).status,403,'shop owners cannot read or manage platform transfer settings');
-    const configureManual=await call('/admin/manual-payment-settings',json({enabled:true,provider:'Test bank',accountName:'QR Print Test',accountNumber:'123456789',instructions:'Use the order number as the transfer note.'},adminAuth));
+    const initialPaymentSettings=await call(`/shops/${shop.id}/payment-settings`,{headers:{authorization:ownerAuth}});
+    assert.equal(initialPaymentSettings.status,200);
+    assert.equal((await initialPaymentSettings.json() as {enabled:boolean}).enabled,false,'manual payment is disabled by default for each shop');
+    assert.equal((await call(`/shops/${shop.id}/payment-settings`,{headers:{authorization:otherOwnerAuth}})).status,404,'another owner cannot read payment details');
+    assert.equal((await call(`/shops/${otherShop.id}/payment-settings`,{...json({enabled:true,provider:'Other bank',accountName:'Other owner',accountNumber:'999',instructions:''},ownerAuth),method:'PUT'})).status,404,'an owner cannot write another shop payment details');
+    assert.equal((await call(`/shops/${shop.id}/payment-settings`,{...json({enabled:true,provider:'',accountName:'',accountNumber:'',instructions:''},ownerAuth),method:'PUT'})).status,400,'manual payment cannot be enabled without account details');
+    assert.equal((await call('/admin/manual-payment-settings',{headers:{authorization:adminAuth}})).status,404,'platform-wide payment settings are no longer exposed');
+    const configureManual=await call(`/shops/${shop.id}/payment-settings`,{...json({enabled:true,provider:'Test bank',accountName:'QR Print Test',accountNumber:'123456789',instructions:'Use the order number as the transfer note.'},ownerAuth),method:'PUT'});
     assert.equal(configureManual.status,200);
     const manualOrderResponse=await call('/orders',json({shopId:shop.id,documentId:document.id,copies:1,paperSize:'A4',color:true,idempotencyKey:`${tag}-manual-order`}));
     assert.equal(manualOrderResponse.status,201);
@@ -419,8 +424,7 @@ test('database-backed tenant, payment, queue, agent lease, event, and retry work
     const manualJob=await authorizedQueue.json() as {job:{id:string}};
     jobIds.push(manualJob.job.id);
   }finally{
-    if(priorManualSetting)await db.platformSetting.update({where:{id:'platform'},data:{manualPaymentEnabled:priorManualSetting.manualPaymentEnabled,manualPaymentProvider:priorManualSetting.manualPaymentProvider,manualPaymentAccountName:priorManualSetting.manualPaymentAccountName,manualPaymentAccountNumber:priorManualSetting.manualPaymentAccountNumber,manualPaymentInstructions:priorManualSetting.manualPaymentInstructions}});
-    else await db.platformSetting.deleteMany({where:{id:'platform'}});
+    await db.shop.update({where:{id:shop.id},data:{manualPaymentEnabled:false,manualPaymentProvider:null,manualPaymentAccountName:null,manualPaymentAccountNumber:null,manualPaymentInstructions:null}});
   }
   const priorPlatformSetting=await db.platformSetting.findUnique({where:{id:'platform'}});
   try{
