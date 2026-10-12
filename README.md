@@ -63,4 +63,5 @@ At `/admin`, a `SUPER_ADMIN` can view registered owner names and emails, printer
 - `dotnet build apps/windows-agent/QRPrint.Agent.csproj` — build the Windows agent on Windows with .NET 8.
 
 Production still requires a secured MongoDB deployment, private persistent document storage, a chosen live payment provider, HTTPS hosting, signed installer distribution, and verification with the shop's actual Windows printer and driver.
-#
+##   Q R p r i n t  
+ 
