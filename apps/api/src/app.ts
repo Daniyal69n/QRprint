@@ -20,6 +20,7 @@ import {createAgentRouter} from './agent-routes.js';
 import {canQueuePayment,hashSecret,mintAgentSecret} from './agent-core.js';
 import {assertDatabaseTarget} from './database-target.js';
 import {createCorsPolicy} from './cors-policy.js';
+import {shopOwnerRegistrationSchema} from './shop-owner-registration.js';
 import {privateStorageRoot,writePrivatePdf,readPrivatePdf,removePrivatePdf,usesPrivateBlob,createPrivateUploadUrl,createPrivateDownloadUrl,privateDocumentKey,MAX_DOCUMENT_BYTES,checkPrivateBlob} from './private-storage.js';
 
 if(!process.env.VERCEL){
@@ -58,12 +59,52 @@ app.use('/orders',async(req,res,next)=>{if(req.method!=='POST'||req.path!=='/')r
 app.use('/orders/:id/queue',async(req,res,next)=>{if(req.method!=='POST')return next();try{const order=await db.order.findUnique({where:{id:routeParam(req,'id')},select:{doubleSided:true,shopId:true}});if(!order?.doubleSided)return next();const shop=await db.shop.findUnique({where:{id:order.shopId},select:{supportsDuplex:true}});if(!shop?.supportsDuplex)return error(res,409,'DUPLEX_DISABLED','The shop no longer offers double-sided printing.');const body=z.object({printerId:z.string()}).safeParse(req.body);if(!body.success)return next();const printer=await db.printer.findFirst({where:{id:body.data.printerId}});if(printer&&!printerSupportsDuplex(printer.capabilities))return error(res,409,'DUPLEX_UNAVAILABLE','Selected printer does not report double-sided printing support.');next();}catch(e){next(e);}});
 
 app.get('/health',async(_req,res)=>{let database='ready',privateStorage='ready',paymentMode=process.env.PAYMENT_MODE||'mock';try{const result=await db.$runCommandRaw({ping:1});if(Number(result.ok)!==1)database='unavailable';const setting=await db.platformSetting.findUnique({where:{id:'platform'}});if(setting?.manualPaymentEnabled)paymentMode='manual-transfer';}catch{database='unavailable';}try{if(usesPrivateBlob())await checkPrivateBlob();else{const root=privateStorageRoot();await mkdir(root,{recursive:true,mode:0o700});await access(root,constants.W_OK);}}catch{privateStorage='unavailable';}const ok=database==='ready'&&privateStorage==='ready';res.status(ok?200:503).json({ok,service:'qr-print-api',database,privateStorage,executionMode,cashOrdersEnabled:process.env.CASH_ORDERS_ENABLED==='true',paymentMode});});
-app.post('/auth/register',async(req,res,next)=>{try{const b=z.object({email:z.string().email(),password:z.string().min(10)}).parse(req.body);const user=await db.user.create({data:{email:b.email,passwordHash:await bcrypt.hash(b.password,12)}});res.status(201).json({token:issueToken(user.id,user.role),role:user.role});}catch(e){next(e);}});
-app.post('/auth/login',async(req,res,next)=>{try{const b=z.object({email:z.string().email(),password:z.string()}).parse(req.body);const user=await db.user.findUnique({where:{email:b.email}});if(!user||!user.isActive||!(await bcrypt.compare(b.password,user.passwordHash)))return error(res,401,'INVALID_CREDENTIALS','Invalid email or password.');res.json({token:issueToken(user.id,user.role),role:user.role});}catch(e){next(e);}});
+const registrationLimiter=rateLimit({windowMs:60*60*1000,limit:5,standardHeaders:true,legacyHeaders:false});
+app.post('/auth/register/shop-owner',registrationLimiter,async(req,res,next)=>{try{
+  const b=shopOwnerRegistrationSchema.parse(req.body);
+  const [existingEmail,existingSlug]=await Promise.all([
+    db.user.findFirst({where:{email:{equals:b.email,mode:'insensitive'}},select:{id:true}}),
+    db.shop.findUnique({where:{slug:b.slug},select:{id:true}}),
+  ]);
+  if(existingEmail)return error(res,409,'EMAIL_ALREADY_REGISTERED','An account already exists for this email. Sign in instead.');
+  if(existingSlug)return error(res,409,'SHOP_SLUG_TAKEN','That shop URL is already in use.');
+  const passwordHash=await bcrypt.hash(b.password,12);
+  const {user,shop}=await db.$transaction(async tx=>{
+    const user=await tx.user.create({
+      data:{
+        name:b.ownerName,
+        email:b.email,
+        passwordHash,
+        role:'SHOP_OWNER',
+        shops:{create:{name:b.shopName,slug:b.slug}},
+      },
+      include:{shops:true},
+    });
+    const shop=user.shops[0];
+    if(!shop)throw new Error('Shop owner registration did not create its shop.');
+    await tx.auditLog.create({data:{actorId:user.id,action:'SHOP_OWNER_REGISTERED',targetType:'Shop',targetId:shop.id,details:{slug:shop.slug}}});
+    return {user,shop};
+  });
+  res.status(201).json({token:issueToken(user.id,'SHOP_OWNER'),role:'SHOP_OWNER',shop:{id:shop.id,name:shop.name,slug:shop.slug}});
+}catch(e){
+  if(e instanceof Prisma.PrismaClientKnownRequestError&&e.code==='P2002')return error(res,409,'REGISTRATION_CONFLICT','The email or shop URL is already in use.');
+  next(e);
+}});
+app.post('/auth/register',async(req,res,next)=>{try{
+  const b=z.object({email:z.string().trim().email().max(254).transform(value=>value.toLowerCase()),password:z.string().min(10)}).strict().parse(req.body);
+  if(await db.user.findFirst({where:{email:{equals:b.email,mode:'insensitive'}},select:{id:true}}))return error(res,409,'EMAIL_ALREADY_REGISTERED','An account already exists for this email.');
+  const user=await db.user.create({data:{email:b.email,passwordHash:await bcrypt.hash(b.password,12)}});
+  res.status(201).json({token:issueToken(user.id,user.role),role:user.role});
+}catch(e){
+  if(e instanceof Prisma.PrismaClientKnownRequestError&&e.code==='P2002')return error(res,409,'EMAIL_ALREADY_REGISTERED','An account already exists for this email.');
+  next(e);
+}});
+app.post('/auth/login',async(req,res,next)=>{try{const b=z.object({email:z.string().trim().email().transform(value=>value.toLowerCase()),password:z.string()}).parse(req.body);const user=await db.user.findFirst({where:{email:{equals:b.email,mode:'insensitive'}}});if(!user||!user.isActive||!(await bcrypt.compare(b.password,user.passwordHash)))return error(res,401,'INVALID_CREDENTIALS','Invalid email or password.');res.json({token:issueToken(user.id,user.role),role:user.role});}catch(e){next(e);}});
 
 app.get('/shops/:slug',async(req,res,next)=>{try{const shop=await db.shop.findUnique({where:{slug:routeParam(req, "slug")},include:{pricing:true}});if(!shop||!shop.isActive)return error(res,404,'SHOP_NOT_FOUND','Shop not found.');res.json({id:shop.id,name:shop.name,pricing:shop.pricing.map(p=>({...p,pricePerPage:Number(p.pricePerPage),colorSurcharge:Number(p.colorSurcharge)}))});}catch(e){next(e);}});
 app.get('/owner/shops',authenticate,requireRole('SHOP_OWNER'),async(req:AuthRequest,res,next)=>{try{res.json(await db.shop.findMany({where:{ownerId:req.user!.id,isActive:true},select:{id:true,name:true,slug:true,isActive:true},orderBy:{createdAt:'asc'}}));}catch(e){next(e);}});
 app.get('/shops/:slug/qr.svg',async(req,res,next)=>{try{const shop=await db.shop.findUnique({where:{slug:routeParam(req, "slug")},select:{slug:true,isActive:true}});if(!shop||!shop.isActive)return error(res,404,'SHOP_NOT_FOUND','Shop not found.');const target=new URL('/upload',publicAppBaseUrl());target.searchParams.set('shop',shop.slug);const svg=await QRCode.toString(target.toString(),{type:'svg',errorCorrectionLevel:'Q',margin:3});res.setHeader('Cache-Control','public, max-age=300');res.setHeader('X-QR-Public-URL',target.toString());res.type('image/svg+xml').send(svg);}catch(e){next(e);}});
+app.get('/shops/:slug/qr.png',async(req,res,next)=>{try{const shop=await db.shop.findUnique({where:{slug:routeParam(req,'slug')},select:{slug:true,isActive:true}});if(!shop||!shop.isActive)return error(res,404,'SHOP_NOT_FOUND','Shop not found.');const target=new URL('/upload',publicAppBaseUrl());target.searchParams.set('shop',shop.slug);const png=await QRCode.toBuffer(target.toString(),{type:'png',errorCorrectionLevel:'Q',margin:3});res.setHeader('Cache-Control','public, max-age=300');res.setHeader('X-QR-Public-URL',target.toString());res.type('image/png').send(png);}catch(e){next(e);}});
 app.post('/shops',authenticate,requireRole('SHOP_OWNER'),async(req:AuthRequest,res,next)=>{try{const b=z.object({name:z.string().min(2),slug:z.string().regex(/^[a-z0-9-]+$/)}).parse(req.body);const shop=await db.shop.create({data:{...b,ownerId:req.user!.id}});await audit(req.user!.id,'SHOP_CREATED','Shop',shop.id);res.status(201).json(shop);}catch(e){next(e);}});
 app.put('/shops/:id/pricing',authenticate,requireRole('SHOP_OWNER','SUPER_ADMIN'),async(req:AuthRequest,res,next)=>{try{const shop=await db.shop.findUnique({where:{id:routeParam(req, "id")}});if(!shop||!canAccessShop(req.user!.role,req.user!.id,shop.ownerId))return error(res,404,'SHOP_NOT_FOUND','Shop not found.');const b=z.object({paperSize:z.enum(['A4','A3','LETTER']),color:z.boolean().default(false),pricePerPage:z.number().nonnegative(),colorSurcharge:z.number().nonnegative().default(0),simpleDefaults:z.record(z.unknown()).optional()}).parse(req.body);const data={...b,simpleDefaults:b.simpleDefaults as Prisma.InputJsonValue|undefined};const row=await db.pricing.upsert({where:{shopId_paperSize_color:{shopId:shop.id,paperSize:b.paperSize,color:b.color}},create:{shopId:shop.id,...data},update:data});await audit(req.user!.id,'PRICING_UPDATED','Shop',shop.id,{paperSize:b.paperSize,color:b.color});res.json(row);}catch(e){next(e);}});
 

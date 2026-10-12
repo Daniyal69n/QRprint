@@ -42,6 +42,45 @@ before(async () => {
   baseUrl = `http://127.0.0.1:${address.port}`;
 });
 
+test('public shop-owner registration atomically creates a fixed-role owner and shop',async()=>{
+  const email=`${tag}-self-service@example.invalid`;
+  const slug=`${tag}-self-service`;
+  const body={ownerName:'Self-service Owner',email,password:'integration-test-password',shopName:'Self-service Print Shop',slug};
+  const roleOverride=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,role:'SUPER_ADMIN'})});
+  assert.equal(roleOverride.status,400);
+  assert.equal(await db.user.findUnique({where:{email},select:{id:true}}),null);
+
+  const response=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  assert.equal(response.status,201);
+  const registered=await response.json() as {token:string;role:string;shop:{id:string;name:string;slug:string}};
+  assert.equal(registered.role,'SHOP_OWNER');
+  assert.ok(registered.token);
+  assert.equal(registered.shop.slug,slug);
+  const owner=await db.user.findUniqueOrThrow({where:{email},include:{shops:true}});
+  userIds.push(owner.id);
+  shopIds.push(...owner.shops.map(shop=>shop.id));
+  auditTargetIds.push(...owner.shops.map(shop=>shop.id));
+  assert.equal(owner.role,'SHOP_OWNER');
+  assert.equal(owner.name,'Self-service Owner');
+  assert.equal(owner.shops.length,1);
+  assert.equal(owner.shops[0]!.ownerId,owner.id);
+
+  const duplicateEmail=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,email:email.toUpperCase(),slug:`${slug}-other`})});
+  assert.equal(duplicateEmail.status,409);
+  const duplicateSlug=await fetch(`${baseUrl}/auth/register/shop-owner`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({...body,email:`${tag}-other@example.invalid`})});
+  assert.equal(duplicateSlug.status,409);
+
+  const ownerShops=await fetch(`${baseUrl}/owner/shops`,{headers:{authorization:`Bearer ${registered.token}`}});
+  assert.equal(ownerShops.status,200);
+  const shops=await ownerShops.json() as Array<{id:string;slug:string}>;
+  assert.deepEqual(shops.map(shop=>shop.id),[owner.shops[0]!.id]);
+
+  const qr=await fetch(`${baseUrl}/shops/${encodeURIComponent(slug)}/qr.png`);
+  assert.equal(qr.status,200);
+  assert.match(qr.headers.get('content-type')??'',/image\/png/);
+  assert.deepEqual(Array.from(new Uint8Array(await qr.arrayBuffer()).slice(0,8)),[137,80,78,71,13,10,26,10]);
+});
+
 after(async () => {
   if (server) { server.close(); await once(server, 'close'); }
   await actualDatabase();
