@@ -3,7 +3,7 @@ using System.Text.Json;
 
 namespace QRPrint.Agent;
 
-public sealed record LocalPrintJob(string Id,string LeaseToken,string Mode,string QueueName,string Stage,string SubmissionEventKey,string ShopId,bool DoubleSided=false,string? ResultEventKey=null,string? ResultStatus=null,string? ResultError=null,string FileExtension="pdf");
+public sealed record LocalPrintJob(string Id,string LeaseToken,string Mode,string QueueName,string Stage,string SubmissionEventKey,string ShopId,bool DoubleSided=false,string? ResultEventKey=null,string? ResultStatus=null,string? ResultError=null,string FileExtension="pdf",string? PageRange=null);
 
 /// <summary>Per-user durable spool. Metadata (including lease tokens) is protected with current-user DPAPI.</summary>
 public static class AgentLocalSpool {
@@ -17,7 +17,7 @@ public static class AgentLocalSpool {
     }
     private static string EncryptedDocumentPath(string shopId,string id)=>Path.Combine(JobDirectory(shopId,id),"document.dpapi");
     public static string DocumentPath(string shopId,string id)=>EncryptedDocumentPath(shopId,id);
-    public static async Task<LocalPrintJob> SaveDownloadedAsync(string shopId,string id,string leaseToken,string mode,string queueName,bool doubleSided,byte[] documentBytes,string fileExtension="pdf") {
+    public static async Task<LocalPrintJob> SaveDownloadedAsync(string shopId,string id,string leaseToken,string mode,string queueName,bool doubleSided,byte[] documentBytes,string fileExtension="pdf",string? pageRange=null) {
         if(!OperatingSystem.IsWindows())throw new PlatformNotSupportedException("Durable agent spool metadata uses Windows DPAPI.");
         var directory=JobDirectory(shopId,id);Directory.CreateDirectory(directory);
         var document=EncryptedDocumentPath(shopId,id);
@@ -28,7 +28,7 @@ public static class AgentLocalSpool {
         }
         var ext=string.IsNullOrWhiteSpace(fileExtension)?"pdf":fileExtension.Trim('.').ToLowerInvariant();
         if(ext!="pdf"&&ext!="docx")ext="pdf";
-        var entry=new LocalPrintJob(id,leaseToken,mode,queueName,"DOWNLOADED",$"submit-{Guid.NewGuid():N}",shopId,doubleSided,FileExtension:ext);
+        var entry=new LocalPrintJob(id,leaseToken,mode,queueName,"DOWNLOADED",$"submit-{Guid.NewGuid():N}",shopId,doubleSided,FileExtension:ext,PageRange:pageRange);
         await SaveAsync(entry);return entry;
     }
     public static async Task SaveAsync(LocalPrintJob entry) {

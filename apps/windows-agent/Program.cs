@@ -8,11 +8,11 @@ namespace QRPrint.Agent;
 public record PrinterCapabilities(string Source, bool SupportsColor, bool CanDuplex, string[] PaperSizes, string[] Resolutions);
 public record PrinterInfo(string Name, bool InstalledQueue, bool Available, string Status, bool IsDefault, PrinterCapabilities? Capabilities = null);
 public record PrintResult(bool Accepted, string Status, string? QueueName, string? Detail);
-public interface IPrinterAdapter { Task<IReadOnlyList<PrinterInfo>> DiscoverAsync(); Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false); }
+public interface IPrinterAdapter { Task<IReadOnlyList<PrinterInfo>> DiscoverAsync(); Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false, string? pageRange = null); }
 
 public sealed class SimulatedPrinterAdapter : IPrinterAdapter {
     public Task<IReadOnlyList<PrinterInfo>> DiscoverAsync() => Task.FromResult<IReadOnlyList<PrinterInfo>>([new("SIMULATED-ONLY", false, true, "SIMULATED", false)]);
-    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false) {
+    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false, string? pageRange = null) {
         if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"PDF file does not exist");
         Console.WriteLine("SIMULATED: queued job; no printer accessed and no pages printed.");
         await Task.Delay(500);
@@ -54,7 +54,7 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         return Task.FromResult<IReadOnlyList<PrinterInfo>>(printers);
     }
 
-    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false) {
+    public async Task<PrintResult> SubmitPdfAsync(string queueName, string pdfPath, bool doubleSided = false, string? pageRange = null) {
         if (!OperatingSystem.IsWindows()) return new(false,"UNAVAILABLE",queueName,"Windows printer queues are available only on Windows.");
         if (!PrinterSettings.InstalledPrinters.Cast<string>().Any(name=>string.Equals(name,queueName,StringComparison.Ordinal))) return new(false,"UNAVAILABLE",queueName,"The exact assigned Windows printer queue is not installed; no fallback queue was used.");
         var settings = new PrinterSettings { PrinterName = queueName };
@@ -65,6 +65,8 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
         if (!File.Exists(pdfPath)) return new(false,"FAILED",queueName,"File does not exist");
         var isDocx = pdfPath.EndsWith(".docx", StringComparison.OrdinalIgnoreCase);
         if (isDocx) {
+            var hasRange = !string.IsNullOrWhiteSpace(pageRange) && !pageRange.Equals("all", StringComparison.OrdinalIgnoreCase);
+            if (hasRange) return await SubmitDocxViaWordComAsync(queueName, pdfPath, doubleSided, pageRange!);
             return await SubmitViaPrintToAsync(queueName, pdfPath, doubleSided);
         }
         var renderer = ResolvePdfRenderer();
@@ -76,9 +78,16 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
                 var duplex = doubleSided ? "duplexlong" : "simplex";
                 args = template.Replace("{printer}", queueName).Replace("{file}", pdfPath).Replace("{duplex}", duplex);
             } else {
-                args = doubleSided
-                    ? $"-print-to \"{queueName}\" -print-settings \"duplexlong\" -silent \"{pdfPath}\""
-                    : $"-print-to \"{queueName}\" -silent \"{pdfPath}\"";
+                var pageArg = BuildSumatraPageArgs(pageRange);
+                if (doubleSided) {
+                    args = string.IsNullOrEmpty(pageArg)
+                        ? $"-print-to \"{queueName}\" -print-settings \"duplexlong\" -silent \"{pdfPath}\""
+                        : $"-print-to \"{queueName}\" -print-settings \"duplexlong,{pageArg}\" -silent \"{pdfPath}\"";
+                } else {
+                    args = string.IsNullOrEmpty(pageArg)
+                        ? $"-print-to \"{queueName}\" -silent \"{pdfPath}\""
+                        : $"-print-to \"{queueName}\" -print-settings \"{pageArg}\" -silent \"{pdfPath}\"";
+                }
             }
             Console.WriteLine($"Print command: {Path.GetFileName(renderer)} to queue '{queueName}' (args: {args}).");
             using var process = Process.Start(new ProcessStartInfo(renderer, args) { UseShellExecute=false, CreateNoWindow=true });
@@ -96,6 +105,64 @@ public sealed class WindowsQueueAdapter : IPrinterAdapter {
             return new(true,"SPOOLER_ACCEPTED",queueName,"The configured renderer returned success and the queue was not marked unavailable. This does not confirm paper output.");
         }
         return await SubmitViaPrintToAsync(queueName, pdfPath, doubleSided);
+    }
+
+    /// <summary>Returns the page range portion of a SumatraPDF -print-settings value, e.g. "4-10" or "45".</summary>
+    private static string BuildSumatraPageArgs(string? pageRange) {
+        if (string.IsNullOrWhiteSpace(pageRange) || pageRange.Equals("all", StringComparison.OrdinalIgnoreCase)) return "";
+        var sanitized = System.Text.RegularExpressions.Regex.Replace(pageRange.Trim(), @"[^0-9,\-]", "");
+        return sanitized;
+    }
+
+    /// <summary>Prints specific pages of a DOCX using Word COM automation via a temporary VBScript.</summary>
+    private static async Task<PrintResult> SubmitDocxViaWordComAsync(string queueName, string docxPath, bool doubleSided, string pageRange) {
+        int fromPage, toPage;
+        var trimmed = pageRange.Trim();
+        var dashIdx = trimmed.IndexOf('-');
+        if (dashIdx > 0 && int.TryParse(trimmed[..dashIdx], out var f) && int.TryParse(trimmed[(dashIdx+1)..], out var t)) {
+            fromPage = f; toPage = t;
+        } else if (int.TryParse(trimmed, out var single)) {
+            fromPage = single; toPage = single;
+        } else {
+            Console.WriteLine($"Could not parse DOCX page range '{pageRange}'; falling back to full document PrintTo.");
+            return await SubmitViaPrintToAsync(queueName, docxPath, doubleSided);
+        }
+        var escapedDoc = docxPath.Replace(@"\", @"\\");
+        var escapedQueue = queueName.Replace("\"", "\"\"");
+        var duplexLine = doubleSided
+            ? $"\r\n    oDoc.PrintOut Background:=False, Range:=3, From:=\"{fromPage}\", To:=\"{toPage}\", ActivePrinterMacroName:=\"{escapedQueue}\", Duplex:=1"
+            : $"\r\n    oDoc.PrintOut Background:=False, Range:=3, From:=\"{fromPage}\", To:=\"{toPage}\", ActivePrinterMacroName:=\"{escapedQueue}\"";
+        var script = $"""
+            Dim oWord, oDoc
+            Set oWord = CreateObject("Word.Application")
+            oWord.Visible = False
+            Set oDoc = oWord.Documents.Open("{escapedDoc}")
+            oWord.ActivePrinter = "{escapedQueue}"
+            {duplexLine.Trim()}
+            oDoc.Close False
+            oWord.Quit
+            """;
+        var vbsPath = Path.Combine(Path.GetTempPath(), $"qrprint-{Guid.NewGuid():N}.vbs");
+        try {
+            await File.WriteAllTextAsync(vbsPath, script);
+            Console.WriteLine($"Print command: Word COM VBScript, pages {fromPage}-{toPage} to queue '{queueName}'.");
+            using var process = Process.Start(new ProcessStartInfo("cscript.exe", $"//NoLogo \"{vbsPath}\"") { UseShellExecute=false, CreateNoWindow=true });
+            if (process is null) {
+                Console.WriteLine("cscript.exe did not start; falling back to full document PrintTo.");
+                return await SubmitViaPrintToAsync(queueName, docxPath, doubleSided);
+            }
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+            try { await process.WaitForExitAsync(timeout.Token); }
+            catch (OperationCanceledException) {
+                try { process.Kill(entireProcessTree:true); } catch {}
+                Console.Error.WriteLine($"Word COM VBScript timed out for queue '{queueName}'.");
+                return new(false,"OUTCOME_UNKNOWN",queueName,"Word COM VBScript did not finish within three minutes; submission outcome is unknown.");
+            }
+            Console.WriteLine($"Word COM VBScript exit code: {process.ExitCode}.");
+            return new(true,"SPOOLER_ACCEPTED",queueName,$"Word COM printed pages {fromPage}-{toPage} to queue. Physical output remains unconfirmed.");
+        } finally {
+            try { File.Delete(vbsPath); } catch {}
+        }
     }
 
     internal static string? ResolvePdfRenderer() {
@@ -243,7 +310,7 @@ public static class Program {
         try{
             var submissionCopy=await AgentLocalSpool.CreateSubmissionCopyAsync(entry.ShopId,entry.Id,entry.FileExtension);
             PrintResult result;
-            try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy,entry.DoubleSided); }
+            try { result=await adapter.SubmitPdfAsync(entry.QueueName,submissionCopy,entry.DoubleSided,entry.PageRange); }
             finally { await AgentLocalSpool.DeleteSubmissionCopyAsync(entry.ShopId,entry.Id,submissionCopy); }
             if(entry.Mode=="SIMULATED"&&result.Accepted)resultStatus="SIMULATED_COMPLETE";
             else if(entry.Mode=="REAL"&&result.Accepted)resultStatus="SPOOLER_ACCEPTED";
@@ -261,7 +328,9 @@ public static class Program {
             Console.WriteLine($"Job {id}: print-options request started.");
             using var options=await api.GetJobPrintOptionsAsync(id,token);
             var doubleSided=options.RootElement.GetProperty("doubleSided").GetBoolean();
-            Console.WriteLine($"Job {id}: print-options completed; duplex={doubleSided}.");
+            string? pageRange=null;
+            if(options.RootElement.TryGetProperty("pageRange",out var prEl)&&prEl.ValueKind==JsonValueKind.String){var prStr=prEl.GetString();if(!string.IsNullOrWhiteSpace(prStr)&&!prStr.Equals("all",StringComparison.OrdinalIgnoreCase))pageRange=prStr.Trim();}
+            Console.WriteLine($"Job {id}: print-options completed; duplex={doubleSided}; pageRange={pageRange??"all"}.");
             deliveryStage="downloading document";
             Console.WriteLine($"Job {id}: download started (GET agent/jobs/{id}/document, X-Job-Lease present, timeout {AgentDocument.DocumentTimeoutSeconds}s).");
             var downloaded=await api.DownloadAsync(id,token);
@@ -275,7 +344,7 @@ public static class Program {
                 Console.WriteLine($"Job {id}: local PDF validation passed.");
             }
             deliveryStage="saving encrypted local spool copy";
-            var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,downloaded.Bytes,downloaded.DocumentType);
+            var local=await AgentLocalSpool.SaveDownloadedAsync(shopId,id,token,mode,queueName,doubleSided,downloaded.Bytes,downloaded.DocumentType,pageRange);
             System.Security.Cryptography.CryptographicOperations.ZeroMemory(downloaded.Bytes);
             Console.WriteLine($"Job {id}: encrypted spool saved.");
             deliveryStage="submitting to printer";
