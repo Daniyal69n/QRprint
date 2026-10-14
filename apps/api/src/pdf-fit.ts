@@ -1,13 +1,19 @@
 import { PDFDocument, degrees } from 'pdf-lib';
 import { paperPoints, type PaperSize } from '@qr-print/shared';
-export type FitOptions = { paperSize:PaperSize; orientation:'AUTO'|'PORTRAIT'|'LANDSCAPE'; marginPt?:number };
+export type FitOptions = { paperSize:PaperSize; orientation:'AUTO'|'PORTRAIT'|'LANDSCAPE'; marginPt?:number; pageIndices?:number[] };
 export async function fitPdf(bytes:Uint8Array, options:FitOptions) {
   const source = await PDFDocument.load(bytes,{ignoreEncryption:false});
   const output = await PDFDocument.create();
   const [baseW,baseH] = paperPoints[options.paperSize];
   const margin = Math.max(0,Math.min(options.marginPt ?? 18,baseW/4,baseH/4));
   const pages = [];
-  for (const original of source.getPages()) {
+  const sourcePages = source.getPages();
+  const targetIndices = options.pageIndices && options.pageIndices.length > 0
+    ? options.pageIndices.filter(i => i >= 0 && i < sourcePages.length)
+    : sourcePages.map((_, i) => i);
+
+  for (const idx of targetIndices) {
+    const original = sourcePages[idx];
     const {width,height} = original.getSize();
     const landscape = options.orientation === 'LANDSCAPE' || (options.orientation === 'AUTO' && width > height);
     const [pageW,pageH] = landscape ? [baseH,baseW] : [baseW,baseH];
@@ -23,3 +29,4 @@ export async function fitPdf(bytes:Uint8Array, options:FitOptions) {
   }
   return {pdf:await output.save(),pageCount:pages.length,pages};
 }
+

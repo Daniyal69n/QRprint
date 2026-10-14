@@ -1,6 +1,6 @@
 'use client';
-import {useEffect,useMemo,useState} from 'react';
-import {calculatePrice,type PaperSize} from '@qr-print/shared';
+import {useEffect,useMemo,useRef,useState} from 'react';
+import {calculatePrice,parsePageRange,type PaperSize} from '@qr-print/shared';
 import {apiUrl} from '../../lib/api-url';
 
 type Price={id:string;paperSize:PaperSize;color:boolean;pricePerPage:number;colorSurcharge:number};
@@ -26,6 +26,14 @@ export default function Upload(){
   const [file,setFile]=useState<File|null>(null),[documentId,setDocumentId]=useState(''),[pageCount,setPageCount]=useState(0),[previewUrl,setPreviewUrl]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false);
   const [paymentMethod,setPaymentMethod]=useState<ShopPaymentMethod|null>(null),[transferMarked,setTransferMarked]=useState(false),[transferReference,setTransferReference]=useState(''),[submittedOrder,setSubmittedOrder]=useState('');
   const [duplexAvailable,setDuplexAvailable]=useState(false),[doubleSided,setDoubleSided]=useState(false);
+
+  // Custom page range states
+  const [pagePrintMode,setPagePrintMode]=useState<'ALL'|'CUSTOM'>('ALL');
+  const [customRange,setCustomRange]=useState('');
+  const [selectedPageNumbers,setSelectedPageNumbers]=useState<number[]>([]);
+  const [rangeError,setRangeError]=useState('');
+
+  const docxContainerRef=useRef<HTMLDivElement|null>(null);
 
   useEffect(()=>{
     const initialSlug=new URLSearchParams(window.location.search).get('shop')||'';
@@ -54,7 +62,78 @@ export default function Upload(){
   },[shop?.id,slug]);
 
   const isDocx = file?.name.toLowerCase().endsWith('.docx') || false;
-  const effectivePages = pageCount > 0 ? pageCount : (documentId ? 1 : 0);
+
+  // Handle parsing custom page ranges whenever customRange or pageCount changes
+  useEffect(()=>{
+    if(pagePrintMode==='ALL'){
+      setSelectedPageNumbers(pageCount>0 ? Array.from({length:pageCount},(_,i)=>i+1) : []);
+      setRangeError('');
+      return;
+    }
+    if(!customRange.trim()){
+      setSelectedPageNumbers([]);
+      setRangeError('Please enter page numbers (e.g. 45 or 4-10).');
+      return;
+    }
+    try{
+      const parsed=parsePageRange(customRange,pageCount>0?pageCount:undefined);
+      if(parsed.length===0){
+        setSelectedPageNumbers([]);
+        setRangeError(pageCount>0 ? `No pages found within 1 to ${pageCount}.` : 'Please enter valid page numbers.');
+      } else {
+        setSelectedPageNumbers(parsed);
+        setRangeError('');
+      }
+    }catch(err){
+      setSelectedPageNumbers([]);
+      setRangeError((err as Error).message);
+    }
+  },[pagePrintMode,customRange,pageCount]);
+
+  // Target preview page to navigate to (e.g., first selected page)
+  const targetPreviewPage = selectedPageNumbers.length > 0 ? selectedPageNumbers[0] : 1;
+
+  // Render docx preview when a docx is uploaded
+  useEffect(()=>{
+    if(!isDocx || !file || !docxContainerRef.current) return;
+    let active = true;
+    (async () => {
+      try {
+        const { renderAsync } = await import('docx-preview');
+        const arrayBuffer = await file.arrayBuffer();
+        if(!active || !docxContainerRef.current) return;
+        docxContainerRef.current.innerHTML = '';
+        await renderAsync(arrayBuffer, docxContainerRef.current, undefined, {
+          inWrapper: false,
+          ignoreWidth: false,
+          ignoreHeight: false
+        });
+      } catch (e) {
+        console.error('Docx render error:', e);
+      }
+    })();
+    return () => { active = false; };
+  }, [isDocx, file, documentId]);
+
+  // Scroll docx preview to target page when page range is specified
+  useEffect(()=>{
+    if(!isDocx || !docxContainerRef.current) return;
+    const pages = docxContainerRef.current.querySelectorAll('.docx-preview-page, section.docx');
+    if(pages.length > 0 && targetPreviewPage <= pages.length) {
+      const pageEl = pages[targetPreviewPage - 1] as HTMLElement;
+      if(pageEl && docxContainerRef.current) {
+        docxContainerRef.current.scrollTo({
+          top: pageEl.offsetTop - docxContainerRef.current.offsetTop,
+          behavior: 'smooth'
+        });
+      }
+    }
+  }, [isDocx, targetPreviewPage]);
+
+  const effectivePages = pagePrintMode === 'CUSTOM'
+    ? selectedPageNumbers.length
+    : (pageCount > 0 ? pageCount : (documentId ? 1 : 0));
+
   const price=shop?.pricing.find(item=>item.paperSize===paper&&item.color===color);
   const estimate=useMemo(()=>price&&effectivePages?calculatePrice(effectivePages,copies,price.pricePerPage,color,price.colorSurcharge):null,[price,effectivePages,copies,color]);
 
@@ -68,6 +147,7 @@ export default function Upload(){
   function clearUploadedDocument(){
     setDocumentId('');setPageCount(0);
     setPreviewUrl(old=>{if(old)URL.revokeObjectURL(old);return '';});
+    setCustomRange('');setPagePrintMode('ALL');setSelectedPageNumbers([]);
   }
 
   async function ensureGuestSession(forceNew=false){
@@ -124,7 +204,7 @@ export default function Upload(){
           setDocumentId(data.id);setPageCount(data.pageCount);
           if(isDocxFile){
             setPreviewUrl('');
-            setMessage('Word document (.docx) ready to print. Direct printing will be sent to the shop printer queue.');
+            setMessage('Word document (.docx) ready. Preview is rendered below.');
           }else{
             await loadPreview(data.id,paper,authToken);
             setMessage(`PDF ready: ${data.pageCount} page(s). The fitted preview is shown below.`);
@@ -141,10 +221,25 @@ export default function Upload(){
 
   async function placeOrder(){
     if(!shop||!documentId||!token)return;
+    if(pagePrintMode==='CUSTOM'&&(rangeError||selectedPageNumbers.length===0)){
+      setMessage('Please enter a valid page range before placing the order.');
+      return;
+    }
     if(paymentMethod?.enabled&&!transferMarked){setMessage('First make the transfer using the displayed shop details, then click “I have sent the transfer” before placing your order.');return;}
     setBusy(true);setMessage('');let createdId='';
     try{
-      const order=await request('/orders',{method:'POST',body:JSON.stringify({shopId:shop.id,documentId,copies,paperSize:paper,color,doubleSided,idempotencyKey:crypto.randomUUID(),manualTransferSent:paymentMethod?.enabled===true&&transferMarked,transferReference})});
+      const order=await request('/orders',{method:'POST',body:JSON.stringify({
+        shopId:shop.id,
+        documentId,
+        copies,
+        paperSize:paper,
+        color,
+        doubleSided,
+        pageRange: pagePrintMode==='CUSTOM'?customRange:undefined,
+        idempotencyKey:crypto.randomUUID(),
+        manualTransferSent:paymentMethod?.enabled===true&&transferMarked,
+        transferReference
+      })});
       createdId=order.id;
       if(paymentMethod?.enabled&&transferMarked){
         setSubmittedOrder(order.id);setTransferMarked(false);
@@ -164,6 +259,12 @@ export default function Upload(){
     finally{setBusy(false);}
   }
 
+  // Generate preview iframe src with #page= anchor for PDF
+  const fittedPreviewUrl = useMemo(()=>{
+    if(!previewUrl) return '';
+    return `${previewUrl}#page=${targetPreviewPage}`;
+  },[previewUrl,targetPreviewPage]);
+
   return <main className="wrap">
     <div className="eyebrow">Customer flow</div><h1>Prepare your print order</h1>
     <p className="muted">No customer account is needed. Scan the shop QR, upload your PDF or Word document (.docx), choose print options, and review the price.</p>
@@ -176,18 +277,70 @@ export default function Upload(){
     <section className="card" style={{maxWidth:720,marginBottom:16}}>
       <h2>2. Upload document</h2>
       <div className="form"><label>PDF or Word document (.docx)<input type="file" accept="application/pdf,.pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,.docx" onChange={event=>{setFile(event.target.files?.[0]||null);setDocumentId('');setPageCount(0);setPreviewUrl('');setTransferMarked(false);setSubmittedOrder('');}}/></label><button className="btn" onClick={uploadPdf} disabled={busy||!file||!shop}>Upload document</button></div>
-      {pageCount>0&&<><p>{pageCount} pages detected. Each output page scales to fit and is centered on the selected paper.</p>{previewUrl&&<iframe title="Fitted document preview" src={previewUrl} style={{width:'100%',height:520,border:'1px solid #cbd7de',borderRadius:8}}/>}</>}
-      {documentId&&pageCount===0&&<div style={{padding:'16px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,marginTop:12}}><p style={{margin:0,fontWeight:600,color:'#166534'}}>Word document (.docx) uploaded and ready for printing.</p><p style={{margin:'4px 0 0',fontSize:14,color:'#15803d'}}>Word documents are sent directly to the printer using native formatting.</p></div>}
+      
+      {documentId&&<div style={{marginTop:16,padding:'12px',border:'1px solid #e2e8f0',borderRadius:8,background:'#f8fafc'}}>
+        <h3 style={{margin:'0 0 8px',fontSize:16}}>Pages to print</h3>
+        <div style={{display:'flex',gap:16,marginBottom:10}}>
+          <label style={{display:'flex',alignItems:'center',gap:6,cursor:'pointer'}}>
+            <input type="radio" name="pageMode" checked={pagePrintMode==='ALL'} onChange={()=>setPagePrintMode('ALL')}/>
+            All pages {pageCount>0?`(${pageCount})`:''}
+          </label>
+          <label style={{display:'flex',alignItems:'center',gap:6,cursor:'pointer'}}>
+            <input type="radio" name="pageMode" checked={pagePrintMode==='CUSTOM'} onChange={()=>setPagePrintMode('CUSTOM')}/>
+            Custom range (e.g. 45 or 4-10)
+          </label>
+        </div>
+        {pagePrintMode==='CUSTOM'&&<div>
+          <label style={{display:'block',marginBottom:4,fontSize:14,color:'#334155'}}>
+            Enter page numbers / ranges:
+            <input
+              type="text"
+              value={customRange}
+              placeholder={pageCount>0?`e.g. 45 or 4-10, 15 (Max: ${pageCount})`:'e.g. 45 or 4-10'}
+              onChange={e=>setCustomRange(e.target.value)}
+              style={{display:'block',width:'100%',maxWidth:360,marginTop:4,padding:'6px 10px',border:'1px solid #cbd5e1',borderRadius:6}}
+            />
+          </label>
+          {rangeError?<p style={{color:'#dc2626',fontSize:13,margin:'4px 0 0'}}>{rangeError}</p>:selectedPageNumbers.length>0&&<p style={{color:'#166534',fontSize:13,margin:'4px 0 0'}}>Printing <strong>{selectedPageNumbers.length}</strong> selected page(s): {selectedPageNumbers.slice(0,10).join(', ')}{selectedPageNumbers.length>10?'...':''}. Preview jumping to page {targetPreviewPage}.</p>}
+        </div>}
+      </div>}
+
+      {pageCount>0&&<div style={{marginTop:16}}>
+        <p>{pageCount} pages detected. Showing preview below{pagePrintMode==='CUSTOM'&&targetPreviewPage>1?` (focused on page ${targetPreviewPage})`:''}:</p>
+        {previewUrl&&<iframe key={`preview-${targetPreviewPage}`} title="Fitted document preview" src={fittedPreviewUrl} style={{width:'100%',height:520,border:'1px solid #cbd7de',borderRadius:8}}/>}
+      </div>}
+
+      {isDocx&&documentId&&<div style={{marginTop:16}}>
+        <div style={{padding:'10px 14px',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:8,marginBottom:12}}>
+          <p style={{margin:0,fontWeight:600,color:'#166534'}}>Word document (.docx) preview</p>
+          <p style={{margin:'4px 0 0',fontSize:13,color:'#15803d'}}>Direct preview rendered below. Showing pages with native formatting.</p>
+        </div>
+        <div
+          ref={docxContainerRef}
+          style={{
+            width:'100%',
+            height:520,
+            overflow:'auto',
+            background:'#525659',
+            padding:'20px',
+            border:'1px solid #cbd7de',
+            borderRadius:8,
+            boxSizing:'border-box'
+          }}
+        />
+      </div>}
     </section>
+
     {shop&&<section className="card" style={{maxWidth:720}}>
       <h2>3. Copies, paper & price</h2>
       <div className="form"><label>Paper<select value={paper} onChange={async event=>{const size=event.target.value as PaperSize;setPaper(size);setTransferMarked(false);if(documentId&&token&&!isDocx){setBusy(true);try{await loadPreview(documentId,size);}catch(error){setMessage((error as Error).message);}finally{setBusy(false);}}}}><option value="A4">A4</option><option value="A3">A3</option><option value="LETTER">US Letter</option></select></label><label>Copies<input type="number" min="1" max="100" value={copies} onChange={event=>{setCopies(Math.max(1,Number(event.target.value)));setTransferMarked(false);}}/></label><label><input type="checkbox" checked={color} onChange={event=>{setColor(event.target.checked);setTransferMarked(false);}}/> Color</label></div>
-      {price?<p>Price per page: Rs {price.pricePerPage}{color&&price.colorSurcharge?` + Rs ${price.colorSurcharge} color surcharge`:''}{estimate!==null&&<strong> · Estimate: Rs {estimate}{pageCount===0?' (1 page min.)':''}</strong>}</p>:<p className="muted">This shop has not configured that paper/color combination.</p>}
+      {price?<p>Price per page: Rs {price.pricePerPage}{color&&price.colorSurcharge?` + Rs ${price.colorSurcharge} color surcharge`:''}{estimate!==null&&<strong> · Estimate: Rs {estimate} ({effectivePages} page{effectivePages===1?'':'s'} × {copies} cop{copies===1?'y':'ies'})</strong>}</p>:<p className="muted">This shop has not configured that paper/color combination.</p>}
       {paymentMethod?.enabled&&estimate!==null&&<section className="card" style={{margin:'12px 0'}}><h3>Pay this shop before placing your order</h3><p>Amount: <strong>Rs {estimate}</strong></p><p>Method: {paymentMethod.provider}</p><p>Account name: <strong>{paymentMethod.accountName}</strong></p><p>Account number: <strong><code>{paymentMethod.accountNumber}</code></strong></p>{paymentMethod.instructions&&<p>{paymentMethod.instructions}</p>}{submittedOrder?<p role="status">Order {submittedOrder} is in the printer queue. The shop relies on your transfer confirmation; it is not independently verified.</p>:<div className="form"><label>Transfer reference (optional)<input value={transferReference} onChange={event=>setTransferReference(event.target.value)} maxLength={120}/></label><button type="button" className="btn" disabled={busy||transferMarked} onClick={()=>{setTransferMarked(true);setMessage('Transfer marked as sent. Place the order to send it directly to the shop printer queue.');}}>{transferMarked?'Transfer marked as sent':'I have sent the transfer'}</button></div>}</section>}
       {paymentMethod?.enabled===false&&process.env.NODE_ENV==='production'&&<p className="muted">This shop has not enabled a payment method, so orders cannot be placed yet.</p>}
-      <button className="btn" onClick={placeOrder} disabled={busy||!token||!documentId||!price||submittedOrder!==''||(process.env.NODE_ENV==='production'&&!paymentMethod?.enabled)||(paymentMethod?.enabled&&!transferMarked)}>Place order</button>
+      <button className="btn" onClick={placeOrder} disabled={busy||!token||!documentId||!price||submittedOrder!==''||(pagePrintMode==='CUSTOM'&&(!!rangeError||selectedPageNumbers.length===0))||(process.env.NODE_ENV==='production'&&!paymentMethod?.enabled)||(paymentMethod?.enabled&&!transferMarked)}>Place order</button>
     </section>}
     {message&&<p role="status" className="banner">{message}</p>}
     <p className="muted">Uploaded documents are not stored in MongoDB. In Production they are temporarily held in private Blob storage until the shop’s Windows Agent downloads the print job; the local agent spool is encrypted. Manual transfer orders are queued immediately based on the customer’s “I have sent the transfer” confirmation; payment is not independently verified.</p>
   </main>;
 }
+

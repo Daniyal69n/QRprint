@@ -11,7 +11,7 @@ import path from 'node:path';
 import {Prisma,PrismaClient,type PrintMode} from '@prisma/client';
 import {z,ZodError} from 'zod';
 import QRCode from 'qrcode';
-import {calculatePrice} from '@qr-print/shared';
+import {calculatePrice,parsePageRange} from '@qr-print/shared';
 import {authenticate,issueToken,requireRole,type AuthRequest} from './auth.js';
 import {fitPdf} from './pdf-fit.js';
 import {getPaymentAdapter} from './payments.js';
@@ -175,7 +175,7 @@ app.post('/documents/complete',authenticate,async(req:AuthRequest,res,next)=>{le
 app.get('/documents/:id/preview',authenticate,async(req:AuthRequest,res,next)=>{try{const q=z.object({paperSize:z.enum(['A4','A3','LETTER']).default('A4'),orientation:z.enum(['AUTO','PORTRAIT','LANDSCAPE']).default('AUTO')}).parse(req.query);const doc=await findActiveDocument(routeParam(req, "id"),req.user!.id);if(!doc)return error(res,404,'DOCUMENT_NOT_FOUND','Document was not found for this customer session. Upload the document again before previewing it.');if(isDocxKey(doc.storageKey))return error(res,400,'PREVIEW_NOT_SUPPORTED','Document preview is not available for Word documents (.docx).');const fitted=await fitPdf(await readPrivatePdf(doc.storageKey),{paperSize:q.paperSize,orientation:q.orientation});res.setHeader('Cache-Control','private, no-store');res.setHeader('X-Fitted-Page-Count',String(fitted.pageCount));const bytes=Buffer.from(fitted.pdf);if(usesPrivateBlob()){const key=`previews/${doc.id}-${q.paperSize}-${q.orientation}.pdf`;await writePrivatePdf(key,bytes,{overwrite:true});return res.redirect(302,await createPrivateDownloadUrl(key));}res.setHeader('Content-Type','application/pdf');res.setHeader('Content-Disposition','inline; filename="qr-print-preview.pdf"');res.send(bytes);}catch(e){next(e);}});
 
 app.post('/orders',authenticate,async(req:AuthRequest,res,next)=>{try{
-  const b=z.object({shopId:z.string().min(1),documentId:z.string().min(1),copies:z.number().int().min(1).max(100),paperSize:z.enum(['A4','A3','LETTER']).default('A4'),color:z.boolean().default(false),doubleSided:z.boolean().default(false),idempotencyKey:z.string().min(12),manualTransferSent:z.boolean().default(false),transferReference:z.string().trim().max(120).optional()}).parse(req.body);
+  const b=z.object({shopId:z.string().min(1),documentId:z.string().min(1),copies:z.number().int().min(1).max(100),paperSize:z.enum(['A4','A3','LETTER']).default('A4'),color:z.boolean().default(false),doubleSided:z.boolean().default(false),pageRange:z.string().trim().max(100).optional(),idempotencyKey:z.string().min(12),manualTransferSent:z.boolean().default(false),transferReference:z.string().trim().max(120).optional()}).parse(req.body);
   const existing=await db.order.findUnique({where:{idempotencyKey:b.idempotencyKey}});
   const idem=resolveOrderIdempotency(existing??undefined,req.user!.id);
   if(idem.kind==='HIDDEN')return error(res,404,'ORDER_NOT_FOUND','Order not found.');
@@ -195,12 +195,22 @@ app.post('/orders',authenticate,async(req:AuthRequest,res,next)=>{try{
   if(!doc)return error(res,404,'DOCUMENT_NOT_FOUND','Document was not found for this customer session. Upload the document again before placing your order.');
   const price=shop.pricing.find(x=>x.paperSize===b.paperSize&&x.color===b.color);
   if(!price)return error(res,400,'PRICE_NOT_CONFIGURED','Shop has not configured that option.');
-  const pages=(doc.pageCount&&doc.pageCount>0)?doc.pageCount:1;
-  const total=calculatePrice(pages,b.copies,Number(price.pricePerPage),b.color,Number(price.colorSurcharge));
+  const totalDocPages=(doc.pageCount&&doc.pageCount>0)?doc.pageCount:1;
+  let selectedPages = totalDocPages;
+  if(b.pageRange&&b.pageRange.toLowerCase()!=='all'&&doc.pageCount&&doc.pageCount>0){
+    try{
+      const parsed=parsePageRange(b.pageRange,doc.pageCount);
+      if(parsed.length===0)return error(res,400,'INVALID_PAGE_RANGE','The specified page range does not contain any valid pages in this document.');
+      selectedPages=parsed.length;
+    }catch(err){
+      return error(res,400,'INVALID_PAGE_RANGE',(err as Error).message);
+    }
+  }
+  const total=calculatePrice(selectedPages,b.copies,Number(price.pricePerPage),b.color,Number(price.colorSurcharge));
   const autoPrintAgent=b.manualTransferSent?await findReadyPrintAgent(shop.id):undefined;
   if(b.manualTransferSent&&!autoPrintAgent?.printer)return error(res,409,'SHOP_PRINTER_NOT_READY','This shop has no registered printer agent ready to receive orders. Contact the shop before sending payment.');
   const order=await db.$transaction(async tx=>{
-    const created=await tx.order.create({data:{shopId:b.shopId,documentId:b.documentId,copies:b.copies,paperSize:b.paperSize,color:b.color,doubleSided:b.doubleSided,idempotencyKey:b.idempotencyKey,customerId:req.user!.id,total}});
+    const created=await tx.order.create({data:{shopId:b.shopId,documentId:b.documentId,copies:b.copies,paperSize:b.paperSize,color:b.color,doubleSided:b.doubleSided,pageRange:b.pageRange||null,idempotencyKey:b.idempotencyKey,customerId:req.user!.id,total}});
     if(b.manualTransferSent){
       await tx.payment.create({data:{orderId:created.id,provider:'manual-transfer',providerRef:`transfer_${randomUUID()}`,amount:total,status:'CUSTOMER_ATTESTED',customerReference:b.transferReference||null}});
       const job=await tx.printJob.create({data:{orderId:created.id,printerId:autoPrintAgent!.printer!.id,mode:executionMode,idempotencyKey:`print:${created.id}`,maxAttempts:Number(process.env.PRINT_MAX_ATTEMPTS)||3}});

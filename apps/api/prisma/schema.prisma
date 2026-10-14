@@ -147,6 +147,7 @@ model Order {
   paperSize       String      @default("A4")
   color           Boolean     @default(false)
   doubleSided     Boolean     @default(false)
+  pageRange       String?
   total           Float
   idempotencyKey  String      @unique
   createdAt       DateTime    @default(now())

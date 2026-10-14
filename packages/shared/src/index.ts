@@ -21,3 +21,41 @@ export function transitionAllowed(from: OrderStatus, to: OrderStatus): boolean {
   };
   return (transitions[from] ?? []).includes(to);
 }
+
+/**
+ * Parses a page range string like "1-5, 8, 11-13" against an optional total page count.
+ * Returns sorted unique 1-indexed page numbers.
+ */
+export function parsePageRange(rangeStr: string, totalPages?: number): number[] {
+  const trimmed = rangeStr.trim();
+  if (!trimmed || trimmed.toLowerCase() === 'all') {
+    if (!totalPages || totalPages < 1) return [];
+    return Array.from({ length: totalPages }, (_, i) => i + 1);
+  }
+  const parts = trimmed.split(/[,;\s]+/).filter(Boolean);
+  const pagesSet = new Set<number>();
+  for (const part of parts) {
+    if (part.includes('-')) {
+      const [startStr, endStr] = part.split('-');
+      const start = parseInt(startStr, 10);
+      const end = parseInt(endStr, 10);
+      if (isNaN(start) || isNaN(end) || start < 1 || end < start) {
+        throw new Error(`Invalid page range token: "${part}"`);
+      }
+      const max = totalPages ? Math.min(end, totalPages) : end;
+      for (let p = start; p <= max; p++) {
+        pagesSet.add(p);
+      }
+    } else {
+      const page = parseInt(part, 10);
+      if (isNaN(page) || page < 1) {
+        throw new Error(`Invalid page number: "${part}"`);
+      }
+      if (!totalPages || page <= totalPages) {
+        pagesSet.add(page);
+      }
+    }
+  }
+  return Array.from(pagesSet).sort((a, b) => a - b);
+}
+

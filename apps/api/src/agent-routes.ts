@@ -5,6 +5,7 @@ import {z} from 'zod';
 import {authenticateAgent,type AgentRequest} from './agent-auth.js';
 import {hashSecret,canTransitionJob,canQueuePayment,canAdoptQueuedJob,claimCasWhere,claimSkipReason,expiredLeaseAction,verifySecret,atomicClaimNext,resolveAgentEvent,type AgentJobState} from './agent-core.js';
 import {fitPdf} from './pdf-fit.js';
+import {parsePageRange} from '@qr-print/shared';
 import {readPrivatePdf,writePrivatePdf,usesPrivateBlob,createPrivateDownloadUrl,isDocxKey,documentMimeType} from './private-storage.js';
 import {describeDocumentDelivery,fittedBlobKey} from './agent-document.js';
 
@@ -130,7 +131,20 @@ export function createAgentRouter(db:PrismaClient){
    const rawBytes=await readPrivatePdf(sourceKey);
    let bytes:Buffer;let pageCount:number;
    if(isDocx){bytes=rawBytes;pageCount=doc.pageCount??0;}
-   else{const fitted=await fitPdf(rawBytes,{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO'});bytes=Buffer.from(fitted.pdf);pageCount=fitted.pageCount;}
+   else{
+     let pageIndices: number[] | undefined;
+     if (job.order.pageRange && job.order.pageRange.toLowerCase() !== 'all') {
+       try {
+         const parsed = parsePageRange(job.order.pageRange, doc.pageCount ?? undefined);
+         if (parsed.length > 0) {
+           pageIndices = parsed.map(p => p - 1);
+         }
+       } catch {}
+     }
+     const fitted=await fitPdf(rawBytes,{paperSize:job.order.paperSize as 'A4'|'A3'|'LETTER',orientation:'AUTO',pageIndices});
+     bytes=Buffer.from(fitted.pdf);
+     pageCount=fitted.pageCount;
+   }
    if(job.status==='LEASED')await db.printJob.updateMany({where:{id:job.id,status:'LEASED',claimedById:agent.id,leaseTokenHash:hashSecret(token)},data:{status:'DOWNLOADED'}});
    res.setHeader('Cache-Control','private, no-store');
    res.setHeader('X-Print-Job-Id',job.id);
